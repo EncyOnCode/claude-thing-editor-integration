@@ -45,7 +45,7 @@ Prefer in this order:
 
 ### 2. Fetch Figma frame
 
-Via Framelink: call `get_figma_data` with fileKey + nodeId. Via REST: `node ~/.claude/skills/thing-editor-figma-sync/scripts/fetch-figma.mjs --url '<figma-url>' > /tmp/figma-snapshot.json`.
+Via Framelink: call `get_figma_data` with fileKey + nodeId. Via REST: `node ${CLAUDE_PLUGIN_ROOT}/skills/thing-editor-figma-sync/scripts/fetch-figma.mjs --url '<figma-url>' > /tmp/figma-snapshot.json`.
 
 Need per node:
 - `name` (matches scene object name)
@@ -63,7 +63,7 @@ Also grab parent frame box to compute relative coords.
 
 Run scene-walker:
 ```bash
-node ~/.claude/skills/thing-editor-figma-sync/scripts/scene-walker.mjs <scene-path>
+node ${CLAUDE_PLUGIN_ROOT}/skills/thing-editor-figma-sync/scripts/scene-walker.mjs <scene-path>
 ```
 Outputs flat JSON map: `{ name: { path: [...], class: "...", props: {...} } }`.
 
@@ -115,11 +115,11 @@ Only when user says "apply" / "да" / confirms explicitly:
 1. Write patch JSON to `/tmp/patch-<name>.json`
 2. Run dry first, show output, wait for confirmation:
 ```bash
-node ~/.claude/skills/thing-editor-figma-sync/scripts/apply-patch.mjs <scene-path> /tmp/patch-<name>.json --dry
+node ${CLAUDE_PLUGIN_ROOT}/skills/thing-editor-figma-sync/scripts/apply-patch.mjs <scene-path> /tmp/patch-<name>.json --dry
 ```
 3. Apply for real only after dry run reviewed:
 ```bash
-node ~/.claude/skills/thing-editor-figma-sync/scripts/apply-patch.mjs <scene-path> /tmp/patch-<name>.json
+node ${CLAUDE_PLUGIN_ROOT}/skills/thing-editor-figma-sync/scripts/apply-patch.mjs <scene-path> /tmp/patch-<name>.json
 ```
 Minimal edit: only touches listed prop keys, preserves key order, preserves tabs/spaces. No reorder, no reformat. Editor diff stays small.
 

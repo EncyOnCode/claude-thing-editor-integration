@@ -30,21 +30,36 @@ If a proposed value looks off, it usually is. Push back.
 
 ## Installation
 
-Skills live in `~/.claude/skills/`. Clone this repo there:
+This repo is a Claude Code **marketplace** containing two **plugins**: `thing-editor` and `thing-editor-figma-sync`.
 
-```bash
-mkdir -p ~/.claude
-git clone https://github.com/<user>/<repo>.git ~/.claude/skills
+### Recommended: install via the plugin marketplace
+
+In Claude Code:
+
+```
+/plugin marketplace add EncyOnCode/claude-thing-editor-integration
+/plugin install thing-editor@thing-editor-integration
+/plugin install thing-editor-figma-sync@thing-editor-integration
 ```
 
-Or if you already have a `~/.claude/skills/` directory, clone into a sibling and merge:
+Updates later:
 
-```bash
-git clone https://github.com/<user>/<repo>.git /tmp/skills-repo
-cp -r /tmp/skills-repo/thing-editor /tmp/skills-repo/thing-editor-figma-sync ~/.claude/skills/
+```
+/plugin marketplace update
 ```
 
-Restart Claude Code (or start a fresh session). The skills should appear in the available-skills list. Trigger them with `/thing-editor` or `/thing-editor-figma-sync`, or by mentioning a Thing-Editor project.
+### Manual install (no marketplace)
+
+Clone the plugin folders into `~/.claude/plugins/`:
+
+```bash
+git clone https://github.com/EncyOnCode/claude-thing-editor-integration.git /tmp/cte
+mkdir -p ~/.claude/plugins
+cp -r /tmp/cte/plugins/thing-editor ~/.claude/plugins/
+cp -r /tmp/cte/plugins/thing-editor-figma-sync ~/.claude/plugins/
+```
+
+Restart Claude Code. The skills appear in the available-skills list. Trigger them with `/thing-editor` or `/thing-editor-figma-sync`, or by mentioning a Thing-Editor project.
 
 ### Figma access (only required for `thing-editor-figma-sync`)
 
@@ -93,19 +108,26 @@ Loaded automatically when you mention Thing-Editor concepts. Provides:
 ```
 .
 ├── README.md
-├── thing-editor/
-│   ├── SKILL.md
-│   └── references/
-│       └── engine-reference.md
-└── thing-editor-figma-sync/
-    ├── SKILL.md
-    ├── references/
-    │   └── coord-mapping.md
-    └── scripts/
-        ├── scene-walker.mjs    # parse .s.json/.p.json into flat path-keyed map
-        ├── apply-patch.mjs     # minimal-edit JSON patcher (preserves key order/whitespace)
-        └── fetch-figma.mjs     # REST-based Figma fetcher (no MCP needed)
+├── .claude-plugin/
+│   └── marketplace.json                    # marketplace catalog
+└── plugins/
+    ├── thing-editor/
+    │   ├── .claude-plugin/plugin.json
+    │   └── skills/thing-editor/
+    │       ├── SKILL.md
+    │       └── references/engine-reference.md
+    └── thing-editor-figma-sync/
+        ├── .claude-plugin/plugin.json
+        └── skills/thing-editor-figma-sync/
+            ├── SKILL.md
+            ├── references/coord-mapping.md
+            └── scripts/
+                ├── scene-walker.mjs         # parse .s.json/.p.json → flat path-keyed map
+                ├── apply-patch.mjs          # minimal-edit JSON patcher (preserves key order/whitespace)
+                └── fetch-figma.mjs          # REST-based Figma fetcher (no MCP needed)
 ```
+
+Scripts inside the figma-sync plugin are referenced via `${CLAUDE_PLUGIN_ROOT}` so they resolve correctly after install.
 
 ---
 

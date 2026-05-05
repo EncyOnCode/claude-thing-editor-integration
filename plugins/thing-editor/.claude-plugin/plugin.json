@@ -1,0 +1,11 @@
+{
+  "name": "thing-editor",
+  "description": "Thing-Editor (PixiJS v7 game engine) reference: scene/prefab JSON format, component conventions, lifecycle gotchas, animation primitives.",
+  "version": "0.1.0",
+  "author": {
+    "name": "EncyOnCode",
+    "url": "https://github.com/EncyOnCode"
+  },
+  "homepage": "https://github.com/EncyOnCode/claude-thing-editor-integration",
+  "license": "MIT"
+}

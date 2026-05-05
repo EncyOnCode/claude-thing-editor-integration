@@ -1,0 +1,19 @@
+{
+  "name": "thing-editor-integration",
+  "owner": {
+    "name": "EncyOnCode",
+    "email": "encyenclosed@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "thing-editor",
+      "source": "./plugins/thing-editor",
+      "description": "Thing-Editor (PixiJS v7 game engine) reference: scene/prefab JSON format, component conventions, lifecycle gotchas."
+    },
+    {
+      "name": "thing-editor-figma-sync",
+      "source": "./plugins/thing-editor-figma-sync",
+      "description": "Sync Thing-Editor scene/prefab JSON to a Figma frame. Diff positions, sizes, colors, text. Patch .s.json/.p.json minimally."
+    }
+  ]
+}
