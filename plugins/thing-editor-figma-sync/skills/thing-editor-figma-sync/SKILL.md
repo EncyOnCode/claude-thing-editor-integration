@@ -165,6 +165,18 @@ Minimal edit: only touches listed prop keys, preserves key order, preserves tabs
 
 Reload editor (user manual) or run game in `mcp__Claude_Preview__preview_start` → screenshot → compare to Figma image. Iterate.
 
+## Engine model — read first
+
+**Before any non-trivial diff** read `references/engine-coordinates.md`. It explains:
+
+- the `resize-attrib` system (`canOverridePivotAndAnchor` master flag, `norm*` props, `useWorld`, `findNearestParent`, `useTextCoordinate`, `stretchAnchor`, `fit`)
+- per-class pivot semantics (Sprite vs SizedContainer vs Text vs DSprite vs NineSlicePlane)
+- the **Sprite scale·normPivot trap** (`scale=0.5, normPivotX=1` → position is at visual center, not right edge)
+- when saved `x/y/pivot` are honored vs overwritten at runtime
+- how to detect editor runaway artifacts (`width: 222533` etc.)
+
+The single most-missed gotcha: **`canOverridePivotAndAnchor=false` (default) means the engine ignores every `norm*` prop**. Patches must touch `x/y/pivot` directly. With `canOverridePivotAndAnchor=true`, patching `x/y/pivot` is useless — engine overwrites them on every recalc. **Check this flag first** on every node you patch.
+
 ## Coord rules — quick
 
 - Figma origin = top-left frame. Translate every node to scene-local by subtracting parent chain.
@@ -192,7 +204,8 @@ Full table in `references/coord-mapping.md`.
 5. **Texture base size lookup required for scale.** Don't guess. Read PNG header or `assets-preloader/main/delayed.json`.
 6. **Default anchor differs by class.** Always check class hierarchy (DSprite=0.5, Sprite=0). See thing-editor skill.
 7. **Never patch `scale.x` / `scale.y` on Text/BitmapText/HTMLText OR on any ancestor container of a Text node.** Pixi transforms multiply down the tree — parent scale ≠ 1 → child Text rasterized canvas resampled → blur/pixelation, even if Text's own scale is 1. Before patching scale on ANY node, walk descendants. If a Text-class found, refuse the scale patch. Adjust `style.fontSize` on each text leaf instead, and adjust child sprite positions individually to keep layout. Same rule for any subclass of Text.
-8. **Analysis-first, never auto-patch.** After computing diff: derive each proposed value with explicit formula trace (show the math and intermediate values), flag every assumption whose engine default is unverified (⚠️), flag every node where the mapping logic is uncertain. Output as a structured findings report. Do NOT write patch JSON files or call apply-patch.mjs automatically — not even with --dry. Wait for user to review the report, correct values if needed, and explicitly approve application.
+8. **Check `canOverridePivotAndAnchor` first on every node.** Default is `false` → engine ignores `norm*` props, only saved `x/y/pivot/width` matter. `true` → engine overwrites `x/y/pivot` from `norm*` on every recalc, so patching them is useless. Pick which props to patch based on this flag. See `references/engine-coordinates.md` §3.1.
+9. **Analysis-first, never auto-patch.** After computing diff: derive each proposed value with explicit formula trace (show the math and intermediate values), flag every assumption whose engine default is unverified (⚠️), flag every node where the mapping logic is uncertain. Output as a structured findings report. Do NOT write patch JSON files or call apply-patch.mjs automatically — not even with --dry. Wait for user to review the report, correct values if needed, and explicitly approve application.
 
 ## Failure modes
 
@@ -209,6 +222,7 @@ Full table in `references/coord-mapping.md`.
 - `scripts/apply-patch.mjs` — minimal JSON patcher (preserves formatting)
 - `scripts/fetch-figma.mjs` — REST-based Figma fetcher (no MCP, needs `FIGMA_TOKEN`)
 - `references/coord-mapping.md` — full coord/color/rotation conversion table
+- `references/engine-coordinates.md` — deep engine reference: resize-attrib lifecycle, per-class pivot semantics, lifecycle, common artifacts
 
 ## Framelink note
 
