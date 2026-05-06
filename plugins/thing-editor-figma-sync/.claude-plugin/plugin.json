@@ -1,7 +1,7 @@
 {
   "name": "thing-editor-figma-sync",
   "description": "Sync Thing-Editor scene/prefab JSON to a Figma frame. Diff positions, sizes, colors, text. Patch .s.json/.p.json minimally. Free Framelink MCP, REST fallback, or paid Figma MCP.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "EncyOnCode",
     "url": "https://github.com/EncyOnCode"
