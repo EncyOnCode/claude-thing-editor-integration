@@ -100,11 +100,49 @@ Threshold: ignore deltas below 1px / 0.01 scale / 1° rotation unless user opts 
 
 ### 6. Report findings (human reviews)
 
-Print structured report per matched node:
-- Current value → proposed value
-- Formula used to derive it (show the math, including intermediate values)
-- Source Figma coords used
-- Any assumption flagged with ⚠️ (unverified engine default, ambiguous frame meaning, normAnchor/normPivot default, etc.)
+**Required report structure — always use this exact format:**
+
+#### Part A — Coordinate derivations (show the chain)
+
+For each non-trivial container in the hierarchy, show how its world origin is computed:
+```
+**[ContainerName] origin in world:**
+[containerName] at (x, y) pivot=(px, py) → origin at world (wx, wy)
+```
+
+#### Part B — Per-node diff table
+
+For each changed prop, one row. Group related props under the same node:
+
+```
+| # | Node path | Prop | Current | Proposed |
+|---|-----------|------|---------|----------|
+| 1 | `container/nodeName` | `propName` | currentValue | **newValue** |
+```
+
+Under each node group, show the derivation formula inline (before or after the table rows for that node):
+```
+**Текущее:** node.y=50 → pivot world y = 490+50=540 → card visual top = 540−59.7 = **480.3**
+**Figma:** card top = **340**. Разница = 140.3px вниз.
+Исправление:
+  card visual top = 340
+  pivot world y   = 340 + 59.7 = 399.7
+  node.y          = 399.7 − 490 = −90.3 ≈ −90
+```
+
+#### Part C — No-change confirmations
+
+List props that were checked and found correct. Keeps trust high.
+
+#### Part D — Flags / assumptions
+
+One bullet per ⚠️. State what was assumed and how to verify.
+
+#### Part E — Apply prompt
+
+End report with: `Применяем?` (or equivalent). Never auto-apply.
+
+---
 
 **Do NOT write patch files or call apply-patch.mjs.** Human reviews report, corrects values if needed, then explicitly triggers application.
 
@@ -132,6 +170,13 @@ Reload editor (user manual) or run game in `mcp__Claude_Preview__preview_start` 
 - Figma origin = top-left frame. Translate every node to scene-local by subtracting parent chain.
 - `DSprite` / `MovieClip` anchor default 0.5 → `scene.x = figma.x + figma.width/2`.
 - Plain `Sprite` anchor 0,0 → `scene.x = figma.x`.
+- `Text` uses BOTH `anchor` (from `style.align`/`verticalAlign`) and `pivot` (from `normPivotX/Y × size`). Read BOTH before computing position.
+  - `style.align='center'` + `normPivotX=0` → `anchor.x=0.5`, `pivot.x=0` → scene.x = **text center** = `figma_left + figma_width/2`
+  - `style.align='left'` + `normPivotX=0` → `anchor.x=0`, `pivot.x=0` → scene.x = **text left** = `figma_left`
+  - `verticalAlign='top'` + `normPivotY=0` → `anchor.y=0`, `pivot.y=0` → scene.y = **text top** = `figma_top` ✓ reliable
+  - `verticalAlign='center'` + `normPivotY=0` → `anchor.y=0.5`, `pivot.y=0` → scene.y = text **center** y ⚠️ PixiJS height ≠ Figma height
+  - Defaults: `style.align='center'`, `verticalAlign='center'`, `normPivotX=0.5`, `normPivotY=0.5`
+  - See `references/coord-mapping.md` → Text section for full formula.
 - Scale: `scale.x = figma.width / textureBaseWidth`. Need texture metadata.
 - Rotation: Figma deg → PixiJS rad. `rad = deg * Math.PI / 180`. Sign may flip — verify.
 - Tint: Figma `{r,g,b}` 0-1 → `Math.round(r*255)<<16 | g*255<<8 | b*255`.

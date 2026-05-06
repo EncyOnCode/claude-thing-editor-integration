@@ -21,6 +21,12 @@ sceneY = N.absoluteBoundingBox.y - rootFrame.y
 
 Then walk down scene tree subtracting any container offsets that don't have a Figma counterpart (rare — usually scene mirrors Figma 1:1).
 
+## Figma bounding box — critical rule
+
+**Figma always reports the TOP-LEFT corner** of a node's bounding box via `absoluteBoundingBox` and `locationRelativeToParent`. This applies to frames, groups, instances, and autolayout frames — regardless of their content or anchor.
+
+For autolayout frames with `sizing: hug`: the bbox wraps all children tightly. The top-left of the bbox is the top-left of the outermost visible content.
+
 ## Anchor adjust (sprite-likes)
 
 Thing-Editor stores sprite position as the anchor point in parent space. Figma stores top-left of bounding box.
@@ -36,6 +42,34 @@ Thing-Editor stores sprite position as the anchor point in parent space. Figma s
 | `Shape` | (0, 0) but draws around `pivot` | `x = figma.x + (pivot.x or 0); y = figma.y + (pivot.y or 0)` |
 
 If scene object overrides `anchor.x/y` (look in `props`), use override not default.
+
+## Prefab instance placement from Figma frame
+
+When a scene node is a prefab instance (`"r": "prefabName"`) with `normPivotX/Y` set, the pivot offset from the card's visual top-left is `pivot.x` and `pivot.y` (already resolved from normPivotX/Y × card dimensions).
+
+**Formula — Figma frame top-left → scene position:**
+
+```
+// parent_origin = parent container's top-left in world coords
+// figma_tl      = Figma frame absoluteBoundingBox top-left in world
+
+scene_x = figma_tl.x − parent_origin.x + pivot.x
+scene_y = figma_tl.y − parent_origin.y + pivot.y
+```
+
+**Verification (reverse):**
+```
+card_visual_tl_world.x = parent_origin.x + scene_x − pivot.x   // must equal figma_tl.x
+card_visual_tl_world.y = parent_origin.y + scene_y − pivot.y   // must equal figma_tl.y
+```
+
+**Important:** X and Y are independent. If X is already visually correct, only compute and patch Y. Do not recalculate X unless it is confirmed wrong.
+
+**Worked example (MatchmakingScreen players):**
+- players container origin in world: (160, 490)
+- Figma left player frame top-left: (454, 340), pivot: (48.3, 59.7)
+- `scene_x = 454 − 160 + 48.3 = 342` ← but user confirmed x=461 is visually correct; skip x
+- `scene_y = 340 − 490 + 59.7 = −90` ← y was wrong (was 50), fix to −90
 
 ## Scale
 
@@ -90,13 +124,67 @@ Figma `visible: false` → scene `visible: false`. 1:1.
 ## Text
 
 ```
-scene.props.text       <- figma.characters
+scene.props.text           <- figma.characters
 scene.props.style.fontSize <- figma.style.fontSize
-scene.props.style.fill <- rgbToHex(figma.fills[0].color)
+scene.props.style.fill     <- rgbToHex(figma.fills[0].color)
 scene.props.style.fontFamily <- figma.style.fontFamily   // map to project font
 ```
 
-**Text bbox lies.** Don't sync `x/y` from Figma text bbox — anchor + font baseline differ. Position text by parent layout, sync only style + content.
+### Text x/y position sync — full engine model
+
+Thing-Editor Text uses **two independent mechanisms** that both affect visual position:
+
+1. **`anchor`** — set by `_refreshAnchor` from `style.align` / `verticalAlign`:
+   ```
+   alignValues = { center: 0.5, left: 0.0, right: 1.0, top: 0.0, bottom: 1.0 }
+   text.anchor.x = alignValues[style.align]
+   text.anchor.y = alignValues[verticalAlign]
+   ```
+   anchor controls where the texture is rendered relative to local origin.
+
+2. **`pivot`** — set by `recalculateCoordinates`:
+   ```
+   pivot.x = text.width  * normPivotX
+   pivot.y = text.height * normPivotY
+   ```
+   pivot shifts the transform origin (what point `position` places in parent space).
+
+**Visual position formula (scale=1, no rotation):**
+```
+visual_ref_x = position.x - pivot.x   // anchor.x=0.5 → ref is center; anchor.x=0 → ref is left
+visual_ref_y = position.y - pivot.y   // anchor.y=0.5 → ref is center; anchor.y=0 → ref is top
+```
+
+More precisely:
+```
+visual_center_x = position.x + (0.5 - anchor.x) * textWidth  - pivot.x
+visual_top_y    = position.y + (0   - anchor.y) * textHeight - pivot.y
+```
+
+**Standard combinations and Figma target:**
+
+| style.align | normPivotX | anchor.x | pivot.x | scene.x means | Figma target |
+|------------|-----------|----------|---------|---------------|--------------|
+| 'center' | 0 | 0.5 | 0 | **center** of text | `figma_left + figma_width / 2` ✓ reliable |
+| 'left' | 0 | 0.0 | 0 | **left edge** | `figma_left` ✓ reliable |
+| 'right' | 0 | 1.0 | 0 | **right edge** | `figma_right` ✓ reliable |
+
+| verticalAlign | normPivotY | anchor.y | pivot.y | scene.y means | Figma target |
+|--------------|-----------|----------|---------|---------------|--------------|
+| 'top' | 0 | 0.0 | 0 | **top edge** | `figma_top` ✓ reliable |
+| 'center' | 0 | 0.5 | 0 | **center** | `figma_top + pixi_height / 2` ⚠️ |
+| 'bottom' | 0 | 1.0 | 0 | **bottom edge** | `figma_bottom` ✓ reliable |
+
+**⚠️ center Y caveat:** `pixi_height` ≠ `figma_text_height`. Figma shows tight glyph bbox; PixiJS uses full line metrics with ascenders/descenders. Cannot compute reliably without running engine. Skip y patch, verify visually.
+
+**Non-standard normPivot (≠ 0) shifts the reference point:**
+```
+extra_shift_x = -normPivotX * textWidth
+extra_shift_y = -normPivotY * textHeight
+```
+Flag ⚠️ if normPivotX or normPivotY ≠ 0 and style.align/verticalAlign is not default.
+
+**Always read `style.align` and `verticalAlign` from scene props before computing. Defaults: both `'center'`.**
 
 **Never patch `scale.x` / `scale.y` on Text-class nodes.** Text renders to a rasterized canvas at fontSize resolution. Scaling resamples that bitmap → blurry, pixelated edges. If Figma frame is bigger/smaller than current text bbox, adjust `style.fontSize` instead:
 
