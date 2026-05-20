@@ -1,0 +1,11 @@
+{
+  "name": "thing-editor-deep",
+  "description": "Deep architectural reference for Thing-Editor (PixiJS v7 game engine): runtime internals, editor architecture, build pipeline, type system, real game patterns, exhaustive gotcha catalog.",
+  "version": "0.1.0",
+  "author": {
+    "name": "EncyOnCode",
+    "url": "https://github.com/EncyOnCode"
+  },
+  "homepage": "https://github.com/EncyOnCode/claude-thing-editor-integration",
+  "license": "MIT"
+}
