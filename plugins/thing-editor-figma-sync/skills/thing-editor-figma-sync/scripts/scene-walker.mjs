@@ -4,7 +4,12 @@
 // Output: JSON to stdout. Default key = "root/child/grandchild" full chain.
 //   --by-name: legacy mode, key by leaf name (collapses duplicates, emits warns).
 //
-// Each entry: { name, path, namePath, class, prefabRef, props, parentName, parentPath, hasTextDescendant, isText, childIndex }
+// Each entry: { name, path, namePath, class, prefabRef, props, parentName, parentPath, hasTextDescendant, isText, childIndex,
+//                canOverridePivotAndAnchor, hasResizer, resizeAttribFlags }
+//
+// canOverridePivotAndAnchor: lifted from p.canOverridePivotAndAnchor. When true, patches must target normPivot*/normAnchor* instead of x/y/pivot.
+// hasResizer: true if class === 'Resizer' or any descendant is Resizer.
+// resizeAttribFlags: summary of resize-attrib flags from props: { useWorld, stretchAnchorX/Y, useTextCoordinate, useGameRootPosition, findNearestParent }
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -36,6 +41,23 @@ function subtreeHasText(node) {
 	return false;
 }
 
+function subtreeHasResizer(node) {
+	if (node.c === 'Resizer') return true;
+	const children = node[':'] ?? [];
+	for (const child of children) {
+		if (subtreeHasResizer(child)) return true;
+	}
+	return false;
+}
+
+function extractResizeAttribFlags(props) {
+	const flags = {};
+	for (const k of ['useWorld', 'stretchAnchorX', 'stretchAnchorY', 'useTextCoordinate', 'useGameRootPosition', 'findNearestParent', 'normPivotX', 'normPivotY', 'normAnchorX', 'normAnchorY', 'normalizePosX', 'normalizePosY']) {
+		if (props && props[k] !== undefined) flags[k] = props[k];
+	}
+	return Object.keys(flags).length > 0 ? flags : null;
+}
+
 function walk(node, path, parentNamePath, parentName, childIndex) {
 	const props = node.p ?? {};
 	const name = props.name ?? null;
@@ -58,7 +80,10 @@ function walk(node, path, parentNamePath, parentName, childIndex) {
 		prefabRef,
 		props,
 		isText,
-		hasTextDescendant
+		hasTextDescendant,
+		canOverridePivotAndAnchor: !!(props.canOverridePivotAndAnchor),
+		hasResizer: subtreeHasResizer(node),
+		resizeAttribFlags: extractResizeAttribFlags(props)
 	};
 
 	const key = byName ? (name ?? namePath) : namePath;
