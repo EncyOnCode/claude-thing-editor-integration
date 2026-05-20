@@ -294,3 +294,11 @@ VS sprite: `texture vs.png` (assumed 397×249), `scale = 229.55/397 = 0.578`. Wi
 `searchingPlayer` Text: `style.align='center'` (default) + `verticalAlign='top'` (set explicitly) → position = (text-center-x, text-top-y). Figma `404×34` at `(757.5, 132)` → in content space `(959.5−910, 132) = (49.5, 132)`. Saved `(50, 132)` ✓.
 
 These numbers reconcile to within 1 px of Figma everywhere except center-aligned Y values, which require visual confirmation.
+
+## See also
+
+- **Per-class `@editable` field reference**: companion plugin `thing-editor-deep/references/03-components.md` — complete catalogue of every built-in component class with editable fields, defaults, gotchas.
+- **NodeExtendData (editor-only metadata, NOT serialized)**: `thing-editor-deep/references/08-types.md` — 61 fields including `isPrefabReference`, `serializationCache`, `__isPreviewMode`.
+- **Pivot trap + DSprite 0.5 anchor + ScrollLayer single-drag**: `thing-editor-deep/references/10-gotchas.md` — exhaustive list of 200 non-obvious behaviors.
+- **Build pipeline (ifdef, vite, electron)**: `thing-editor-deep/references/07-build.md` — for understanding why prod uses jsDelivr CDN and dev uses local pixi.
+- **MovieClip timeline JSON schema**: `thing-editor-deep/references/05-animation.md` — full TimelineSerializedData + FieldPlayer easing equations.
