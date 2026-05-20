@@ -237,7 +237,13 @@ Don't duplicate engine knowledge here. Cross-references:
 - **DSprite anchor 0.5, ScrollLayer single-drag, etc.:** `thing-editor-deep/references/10-gotchas.md`
 - **MovieClip timeline JSON, FieldPlayer easing:** `thing-editor-deep/references/05-animation.md`
 
-The single most-missed gotcha: **`canOverridePivotAndAnchor=false` (default) means the engine ignores every `norm*` prop**. Patches must touch `x/y/pivot` directly. With `canOverridePivotAndAnchor=true`, the engine overwrites `x/y/pivot` from `norm*` on every recalc, so patching them is useless. The `diff-snapshot.mjs` script flags this automatically via the pre-diff probe.
+The two most-missed gotchas:
+
+1. **`canOverridePivotAndAnchor=false` (default) means the engine ignores every `norm*` prop**. Patches must touch `x/y/pivot` directly. With `canOverridePivotAndAnchor=true`, the engine overwrites `x/y/pivot` from `norm*` on every recalc, so patching them is useless. The `diff-snapshot.mjs` script flags this automatically via the pre-diff probe.
+
+2. **A child of `LayoutGroup`/`LayoutGrid`/`Resizer` has its `x/y` written by the parent every frame** (`layoutChildren()`). Patching the child's `x` is also useless — change the parent's `spacingX/Y` / `paddingLeft/Right/Top/Bottom` / `aligmentX/Y` instead. Same for `width`/`height` when parent has `sizeModeH/V ∈ {both, stretch, shrink}` or when the LayoutGroup itself has `dynamicSize: true`.
+
+The walker emits a `_resize` block on every node summarizing all these flags, and `apply-patch.mjs` refuses patches that would be silently overwritten — see the "Patcher refuse matrix" in `references/coord-mapping.md`.
 
 ## 8. Non-negotiable rules
 
@@ -248,7 +254,7 @@ The single most-missed gotcha: **`canOverridePivotAndAnchor=false` (default) mea
 5. **Texture base size lookup required for scale.** Don't guess. Use `texture-base.mjs` (atlas / spritesheet / PNG header).
 6. **Default anchor differs by class.** Always check class hierarchy (DSprite=0.5, Sprite=0). See `class-tokens.mjs`.
 7. **Never patch `scale.x` / `scale.y` on Text/BitmapText/HTMLText OR any ancestor.** Pixi transforms multiply down — parent scale ≠ 1 → child Text rasterized canvas resampled → blur. `apply-patch.mjs` refuses these unless `--force`. Adjust `style.fontSize` on each text leaf instead.
-8. **Check `canOverridePivotAndAnchor` first on every node.** `diff-snapshot.mjs` emits a flag automatically. With `true`, patch `norm*` instead of `x/y/pivot`.
+8. **Check `_resize` flags before computing patch values.** Walker emits a `_resize` block on every node with `canOverride`, `useWorld`, `stretchAnchorX/Y`, `parentClass`, `parentIsLayoutManaged`, `parentSizeModeH/V`, `selfIsLayoutGroup`, `selfDynamicSize`, `selfOrientation`. Patcher refuses entries that would be silently overwritten by `recalculateCoordinates()`, `LayoutGroup.layoutChildren()`, `stretchAnchor` or `dynamicSize`. See "Patcher refuse matrix" in `references/coord-mapping.md`. To override (e.g. when you've also patched the parent), pass `--force`.
 9. **Analysis-first, never auto-patch.** Derive each proposed value with explicit formula trace. Flag every assumption with ⚠️. Output structured findings report. Do NOT write patch JSON OR call apply-patch.mjs automatically — wait for user approval. `--auto-apply` is opt-in user gesture.
 10. **Soft naming enforcement.** Validator output never blocks compare/generator. Even with errors, those workflows proceed using auto-infer fallbacks. Surface issues; let user fix on their schedule.
 11. **Generated skeletons are never authoritative.** Always present `.TODO.md` to user; never claim "done" after a generator run. The skeleton is a starting point, not a finished scene.
@@ -266,8 +272,8 @@ The single most-missed gotcha: **`canOverridePivotAndAnchor=false` (default) mea
 
 ## 10. Reference files
 
-- `scripts/scene-walker.mjs` — parse scene JSON to flat map (extended in v2 with hasResizer, canOverridePivotAndAnchor, resizeAttribFlags)
-- `scripts/apply-patch.mjs` — minimal JSON patcher (preserves formatting, supports `op:'delete'`, `--allow-class-change`)
+- `scripts/scene-walker.mjs` — parse scene JSON to flat map; emits `_resize` block per node (canOverride, useWorld, stretchAnchorX/Y, parent layout flags, self LayoutGroup flags)
+- `scripts/apply-patch.mjs` — minimal JSON patcher (preserves formatting). Refuse guards: scale-on-text, recalc-overwritten position/pivot, stretch/layout-overridden width/height. `--force` overrides.
 - `scripts/fetch-figma.mjs` — REST-based Figma fetcher (no MCP, needs `FIGMA_TOKEN`)
 - `scripts/figma-walker.mjs` — classify Figma snapshot, parse `[Class] name (meta)` tags
 - `scripts/diff-snapshot.mjs` — Workflow A entry (compare + report + optional patch + optional auto-apply)

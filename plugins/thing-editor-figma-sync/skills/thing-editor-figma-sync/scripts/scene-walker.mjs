@@ -4,17 +4,16 @@
 // Output: JSON to stdout. Default key = "root/child/grandchild" full chain.
 //   --by-name: legacy mode, key by leaf name (collapses duplicates, emits warns).
 //
-// Each entry: { name, path, namePath, class, prefabRef, props, parentName, parentPath, hasTextDescendant, isText, childIndex,
-//                canOverridePivotAndAnchor, hasResizer, resizeAttribFlags }
+// Each entry: { name, path, namePath, class, prefabRef, props, parentName, parentPath,
+//               hasTextDescendant, isText, childIndex, _resize }
 //
-// canOverridePivotAndAnchor: lifted from p.canOverridePivotAndAnchor. When true, patches must target normPivot*/normAnchor* instead of x/y/pivot.
-// hasResizer: true if class === 'Resizer' or any descendant is Resizer.
-// resizeAttribFlags: summary of resize-attrib flags from props: { useWorld, stretchAnchorX/Y, useTextCoordinate, useGameRootPosition, findNearestParent }
+// _resize: derived flags for patcher refuse-rules. See references/coord-mapping.md.
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const TEXT_CLASS_RE = /(^|[^A-Za-z])(Text|BitmapText|HTMLText)([^A-Za-z]|$)/;
+const LAYOUT_MANAGED_PARENT_CLASSES = new Set(['LayoutGroup', 'LayoutGrid', 'Resizer']);
 
 const args = process.argv.slice(2);
 const byName = args.includes('--by-name');
@@ -41,24 +40,28 @@ function subtreeHasText(node) {
 	return false;
 }
 
-function subtreeHasResizer(node) {
-	if (node.c === 'Resizer') return true;
-	const children = node[':'] ?? [];
-	for (const child of children) {
-		if (subtreeHasResizer(child)) return true;
-	}
-	return false;
+function deriveResizeFlags(node, parent) {
+	const p = node.p ?? {};
+	const pp = parent?.p ?? {};
+	const parentClass = parent?.c ?? null;
+	const parentIsLayoutManaged = parentClass ? LAYOUT_MANAGED_PARENT_CLASSES.has(parentClass) : false;
+	const selfIsLayoutGroup = node.c === 'LayoutGroup' || node.c === 'LayoutGrid' || node.c === 'Resizer';
+	return {
+		canOverride: !!p.canOverridePivotAndAnchor,
+		useWorld: !!p.useWorld,
+		stretchAnchorX: Number(p.stretchAnchorX) || 0,
+		stretchAnchorY: Number(p.stretchAnchorY) || 0,
+		parentClass,
+		parentIsLayoutManaged,
+		parentSizeModeH: pp.sizeModeH || 'none',
+		parentSizeModeV: pp.sizeModeV || 'none',
+		selfIsLayoutGroup,
+		selfDynamicSize: !!p.dynamicSize,
+		selfOrientation: p.orientation || null
+	};
 }
 
-function extractResizeAttribFlags(props) {
-	const flags = {};
-	for (const k of ['useWorld', 'stretchAnchorX', 'stretchAnchorY', 'useTextCoordinate', 'useGameRootPosition', 'findNearestParent', 'normPivotX', 'normPivotY', 'normAnchorX', 'normAnchorY', 'normalizePosX', 'normalizePosY']) {
-		if (props && props[k] !== undefined) flags[k] = props[k];
-	}
-	return Object.keys(flags).length > 0 ? flags : null;
-}
-
-function walk(node, path, parentNamePath, parentName, childIndex) {
+function walk(node, path, parentNamePath, parentName, childIndex, parent) {
 	const props = node.p ?? {};
 	const name = props.name ?? null;
 	const cls = node.c ?? null;
@@ -81,21 +84,18 @@ function walk(node, path, parentNamePath, parentName, childIndex) {
 		props,
 		isText,
 		hasTextDescendant,
-		canOverridePivotAndAnchor: !!(props.canOverridePivotAndAnchor),
-		hasResizer: subtreeHasResizer(node),
-		resizeAttribFlags: extractResizeAttribFlags(props)
+		_resize: deriveResizeFlags(node, parent)
 	};
 
 	const key = byName ? (name ?? namePath) : namePath;
 	if (out[key]) {
-		// In path-keyed mode duplicate path = same node twice (impossible). In name mode, collisions expected.
 		console.error(`warn: duplicate key "${key}" at ${pathStr(path)} (prev at ${pathStr(out[key].path)})`);
 	}
 	out[key] = entry;
 
 	const children = node[':'] ?? [];
 	children.forEach((child, i) => {
-		walk(child, [...path, ':', i], namePath, name ?? parentName, i);
+		walk(child, [...path, ':', i], namePath, name ?? parentName, i, node);
 	});
 }
 
@@ -103,5 +103,5 @@ function pathStr(p) {
 	return p.length === 0 ? '<root>' : p.join('.');
 }
 
-walk(root, [], null, null, null);
+walk(root, [], null, null, null, null);
 process.stdout.write(JSON.stringify(out, null, 2));
