@@ -178,12 +178,22 @@ game.hideModal()                            // hide top modal
 // State
 game.currentScene: Scene                   // active scene
 game.currentContainer: Container           // top modal or current scene
+game.stage: Container                      // root PIXI container
+game.pixiApp: PIXI.Application             // raw Application (renderer, ticker)
 game.W, game.H: number                     // logical game dimensions
 game.isPortrait: boolean
-game.isMobile.any: boolean
-game.mouse: { x, y, click }
+game.isMobile.any: boolean                 // also .ios, .android, .tablet, .phone (from PIXI.utils.isMobile)
+game.mouse: Mouse                          // extends PIXI.Point — has x, y, click
 game.time: number                          // frame counter
 game.all: ThingSceneAllMap                 // shortcut to currentScene.all
+game.data: GameData                        // user-defined shared state
+game.classes: GameClasses                  // class registry (from .tmp/classes.js)
+game.fullscreen: FullScreen                // FullScreen helper
+
+// Utilities
+game.openUrl(url, target?)                 // safe external link
+game.showQuestion(title, message, yesLabel?, yesCb?, noLabel?, noCb?)  // yes/no modal
+game.forAllChildrenEverywhere(cb)          // iterate all nodes (scenes + modals)
 
 // Events
 game.on('update', cb)                      // every frame
@@ -248,6 +258,15 @@ import editable from 'thing-editor/src/editor/props-editor/editable';
 @editable({ type: 'select', select: [{name,value}] })
 @editable({ type: 'splitter', title: 'Section' })  // visual separator (not serialized)
 @editable({ type: 'btn', name: 'Label', onClick: fn }) // editor button
+@editable({ type: 'rect' })                         // {x,y,w,h} editor
+@editable({ type: 'ref' })                          // reference to scene object
+@editable({ type: 'l10n' })                         // localization key picker
+@editable({ type: 'timeline' })                     // MovieClip timeline data
+@editable({ type: 'curve' })                        // bezier curve editor
+@editable({ type: 'slider', min: 0, max: 1 })       // slider input
+@editable({ type: 'resource' })                     // generic resource picker
+@editable({ type: 'pow-damp-preset' })              // physics preset
+@editable({ type: 'spine-sequence' })               // Spine animation sequence
 @editable({ animate: true })                        // can be keyframed in MovieClip timeline
 @editable({ notSerializable: true })               // shown in editor but not saved to JSON
 @editable({ visible: (obj) => obj.someFlag })      // conditional visibility
@@ -303,13 +322,13 @@ const tween = new TickerTween(targetDisplayObject, durationInSeconds)
   .to(
     () => obj.x,           // getter
     (v) => obj.x = v,      // setter
-    100,                   // target value
+    100,                   // toValue (number)
     Easing.outCubic        // easing
   )
   .moveTo({ x: 100, y: 200 }, Easing.inOutCubic)   // shorthand for position
   .scaleTo({ x: 1.5, y: 1.5 }, Easing.outBack)     // shorthand for scale
   .alphaTo(0, Easing.inCubic)                        // shorthand for alpha
-  .colorTo(() => obj.tint, (v) => obj.tint = v, 0xff0000, Easing.none)
+  .colorTo(() => obj.tint, (v) => obj.tint = v, 0xff0000, Easing.none) // 3rd arg = toColor (number)
   .onUpdate((t) => { /* t = 0..1 */ })
   .onComplete(() => { /* done */ })
   .yoyo(true, 3)           // ping-pong, 3 times
@@ -444,7 +463,7 @@ Common tokens: `EventBusToken`, `ClientProviderToken`, `ConnectionServiceToken`
 
 1. `game.showScene('name')` → fader starts
 2. Fader covers screen → `Lib.loadScene('name')` called
-3. Scene deserialized: children created recursively, `init()` called bottom-up
+3. Scene deserialized: tree built, then `constructRecursive()` calls `init()` **top-down** (parent first, then each child)
 4. `scene._refreshAllObjectRefs()` → builds `scene.all` map
 5. Fader hides → `scene.onShow()` called + `'on-scene-show'` event
 6. Each frame: `game.emit('update')` → `currentContainer.update()` recurses tree
@@ -605,8 +624,12 @@ All in `thing-editor/src/engine/lib/assets/src/{basic,extended}/`. Each is a `.c
 |---|---|---|
 | `SizedContainer` | Container | Container with explicit `width/height` for layout |
 | `LayeredContainer` | Container | Children rendered in another container ("portal") |
+| `LayeredContainerPortal` | Container | Sibling end of LayeredContainer; receives the redirected children |
 | `Mask` | Container | Renders children as mask for siblings |
 | `Resizer` | Container | Re-positions children on resize per rules |
+| `ParentResizer` | Resizer | Auto-resizes parent Shape's width/height to its own |
+| `OrientationTrigger` | Container | Show/hide children per portrait/landscape |
+| `OrientationParentResizer` | OrientationTrigger | Combined orientation + parent resize |
 | `ScrollLayer` | Container | Scrollable area |
 | `ScrollBar` | Shape | Scrollbar widget |
 | `ProgressBar` | Container | Fill-bar widget |
@@ -617,6 +640,7 @@ All in `thing-editor/src/engine/lib/assets/src/{basic,extended}/`. Each is a `.c
 | `Trigger` | Container | Conditional show/hide based on data-path value |
 | `IsMobileTrigger` | OrientationTrigger | Show only on mobile |
 | `ShapeGradient` | Shape | Shape with gradient fill |
+| `ParticleShort` | DSprite | Lightweight short-duration particle |
 
 ### System assets (`___system/`)
 
@@ -689,15 +713,15 @@ Invokes a function via path string. Used by editor's callback fields (`@editable
 import callByPath from 'thing-editor/src/engine/utils/call-by-path';
 
 callByPath('all.gameController.start', this);
-callByPath('this.doSomething`arg1`arg2', this);     // backtick-separated args
-callByPath('data.score`100', this);                 // sets game.data.score = 100 if it's setValueByPath
+callByPath('this.doSomething,arg1,arg2', this);     // comma-separated args
+callByPath('data.score,100', this);                 // sets game.data.score = 100 if it's setValueByPath
 ```
 
 **Path syntax in callback strings:**
 - `all.objName.method` — call method on named scene object
 - `this.method` — call method on owner
-- Backtick `` ` `` separates parameters
-- Comma `,` for special syntaxes (DI targets in ShapeButton)
+- Comma `,` separates parameters (path is `string.split(',')`-ed)
+- DI targets in ShapeButton use the same comma syntax: `"targetName,methodName,param"`
 
 ---
 
@@ -706,12 +730,13 @@ callByPath('data.score`100', this);                 // sets game.data.score = 10
 ```typescript
 import { Keys } from 'thing-editor/src/engine/utils/keys';
 
-Keys.up / down / left / right       // arrow + WASD
-Keys.shiftKey / ctrlKey / altKey
+Keys.up / down / left / right       // arrow + WASD (booleans)
+Keys.shiftKey / ctrlKey / altKey    // modifier booleans
 Keys.all: Set<number>               // raw keyCode set
 
-// On game singleton:
-game.keys.up                         // same as Keys.up
+// On game singleton (proxy to Keys):
+game.keys.up / down / left / right
+game.keys.shiftKey / ctrlKey / altKey
 ```
 
 `Keys.update()` runs in `_updateGlobal()` after frame — keyup events queued and applied between frames.
@@ -779,7 +804,7 @@ Generated by editor's `Build` action. Loaded at runtime by `game.init()`:
 
 | File | Contents |
 |---|---|
-| `.tmp/classes.js` | All custom + engine classes (registered into `game.classes`) |
+| `.tmp/classes.ts` | All custom + engine classes (registered into `game.classes`); transpiled by Vite |
 | `.tmp/assets-preloader.json` | Minimal assets for preloader scene (loaded immediately) |
 | `.tmp/assets-main.json` | Main game assets (loaded after preloader scene shows) |
 | `.tmp/assets-delayed.json` | Delayed assets (loaded after main scene starts) |
@@ -791,8 +816,10 @@ Generated by editor's `Build` action. Loaded at runtime by `game.init()`:
   scenes: { [name]: SerializedObject },
   images: string[],
   sounds: [string, SoundMetadata][],
-  text: LanguageData,
-  resources: string[],
+  text?: LanguageData,
+  resources?: string[],
+  xmls?: { [name]: string },
+  fonts?: string[],
   projectDesc?: ProjectDesc
 }
 ```
@@ -801,17 +828,19 @@ Generated by editor's `Build` action. Loaded at runtime by `game.init()`:
 
 ## Fader System
 
-Faders are **prefabs** under `assets/fader/*.p.json`. The default is `fader/default`. They're MovieClips with two labels:
-- `show fader` — fade-in animation (covers the screen)
-- `hide fader` — fade-out animation
+Faders are **prefabs** under `assets/fader/*.p.json`. Default = `fader/default`. They're MovieClips. The default fader has ONE explicit label `hide fader`; the "show" phase is just the timeline playing from frame 0. Callbacks are wired into the timeline via keyframe `"a"` (action) entries:
+- Frame 0..N: fade-in plays automatically (no label needed)
+- At a keyframe `"a": "faderShoot"` → engine swaps the scene
+- At label `hide fader`: fade-out plays
+- At a keyframe `"a": "faderEnd"` → fader destroyed
 
 When `game.showScene()` is called:
 1. Fader prefab loaded, added to stage
-2. Scene starts loading; fader plays "show fader" labels
-3. Fader fires `game.faderShoot()` (engine callback) when fully covering
+2. Scene starts loading; fader timeline plays from frame 0 (fade-in)
+3. Fader timeline fires `game.faderShoot()` when fully covering
 4. Engine swaps current scene
-5. Fader plays "hide fader" labels
-6. Fader fires `game.faderEnd()` → fader destroyed
+5. Fader jumps to `hide fader` label and plays fade-out
+6. Fader timeline fires `game.faderEnd()` → fader destroyed
 
 Set per-scene fader:
 ```typescript
@@ -854,6 +883,8 @@ After resize, all containers receive `_onRenderResize()` recursively (one frame 
 
 ## ProjectDesc (`thing-project.json`)
 
+Schema: `thing-editor/src/engine/lib/schema-thing-project.json`.
+
 ```json
 {
   "id": "durak",
@@ -862,18 +893,25 @@ After resize, all containers receive `_onRenderResize()` recursively (one frame 
   "dynamicStageSize": true,
   "width": 1920,
   "height": 1080,
+  "portraitWidth": 1080,
+  "portraitHeight": 1920,
   "renderResolution": 1,
   "renderResolutionMobile": 1,
+  "scaleMode": "nearest" | "linear",
   "defaultFont": "Roboto",
-  "mainScene": "main",
-  "preloader": "skill-games-preloader",
+  "preloadScene": "preloader",
   "libs": ["ui-common-lib", "skill-games-client-lib"],
   "lowQualityVariants": { "img/big.png": "img/big-lowq.png" },
   "loadOnDemandSounds": { "soundKey": 1|2 },
   "framesSkipLimit": 4,
+  "soundFormats": ["webm", "mp3"],
+  "jpgQuality": 80,
+  "embedLocales": true,
   "webfontloader": { ... }
 }
 ```
+
+There is **no `mainScene` field** — the engine boots into `preloadScene`; from there your code calls `game.showScene('...')`.
 
 ---
 
@@ -894,12 +932,12 @@ After resize, all containers receive `_onRenderResize()` recursively (one frame 
 
 ## Common Gotchas
 
-1. **`init()` called bottom-up** — children's `init()` runs before parent's. Don't access `parent.something` set in parent's `init()` from child's `init()`.
+1. **`init()` called top-down** — parent's `init()` runs before children's (`constructRecursive()` in `lib.ts`). A child's `init()` CAN read `parent.something` set in parent's `init()`. The opposite is NOT true: parent's `init()` runs before children are initialized, so don't touch `child.foo` (set in child's init) from the parent's own `init()`.
 2. **`super.init()` MUST be called** — schedules `_onRenderResize()`.
 3. **Removing listeners in `onRemove()` is mandatory** — orphaned listeners cause memory leaks + ghost callbacks.
 4. **Don't hand-edit `.s.json`/`.p.json`** — editor sorts keys, can produce massive diffs.
 5. **`game.all` is the active scene's `all`** — modal containers don't have `all`.
-6. **Naming convention**: object names with `.`, `#`, `\``, `,` are auto-replaced with `_` (these chars used in data paths).
+6. **Naming convention**: avoid `.`, `#`, backtick, `,` in object names — these are data-path/callback separators. Sanitization is enforced in localization keys and timeline field names (not globally on every name), so a stray `.` in `obj.name` may not crash but will silently break `getValueByPath('all.objName')`.
 7. **DSprite's anchor 0.5** trips up new devs expecting top-left origin.
 8. **`update()` called even when `visible=false`** unless overridden — only render is skipped.
 9. **TickerTween creates own PIXI.Ticker** — leaking them costs CPU; always `.destroy()`.
