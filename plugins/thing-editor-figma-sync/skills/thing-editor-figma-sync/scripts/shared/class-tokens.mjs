@@ -65,15 +65,56 @@ export const ALIASES = {
 
 // Text-bearing classes (used by scene-walker hasTextDescendant + apply-patch text guard).
 export const TEXT_CLASSES = new Set(['Text', 'Label', 'BitmapText', 'HTMLText']);
+export const LAYOUT_MANAGED_CLASSES = new Set(['LayoutGroup', 'LayoutGrid', 'Resizer']);
+
+// Project-scanned custom classes registered at runtime via extendTokens(registry).
+// Module state — each subprocess that consumes --project must call extendTokens
+// after loading its registry; state does not survive across processes.
+const EXTRA_TOKENS = {};
+const EXTRA_LAYOUT_MANAGED = new Set();
+const EXTRA_TEXT_CLASSES = new Set();
+
+export function extendTokens(registry) {
+	if (!registry?.classes) return;
+	for (const [name, info] of Object.entries(registry.classes)) {
+		if (CLASS_TOKENS[name]) continue; // builtin wins
+		EXTRA_TOKENS[name] = {
+			engineClass: name,
+			anchor: info.anchor ?? null,
+			requiredMeta: [],
+			optionalMeta: [],
+			notes: `custom class from ${info.source} (chain: ${info.chain.join(' -> ')})`,
+			chain: info.chain,
+			source: info.source,
+			custom: true
+		};
+		if (info.isLayoutManaged) EXTRA_LAYOUT_MANAGED.add(name);
+		if (info.isText) EXTRA_TEXT_CLASSES.add(name);
+	}
+}
+
+export function getTokenSpec(token) {
+	return CLASS_TOKENS[token] || EXTRA_TOKENS[token] || null;
+}
+
+export function isLayoutManaged(cls) {
+	if (!cls) return false;
+	if (LAYOUT_MANAGED_CLASSES.has(cls)) return true;
+	return EXTRA_LAYOUT_MANAGED.has(cls);
+}
 
 // Returns canonical token if input matches (case-sensitive) OR null.
 export function resolveToken(raw) {
 	if (CLASS_TOKENS[raw]) return { token: raw, caseMatch: true };
+	if (EXTRA_TOKENS[raw]) return { token: raw, caseMatch: true, custom: true };
 	if (ALIASES[raw]) return { token: ALIASES[raw], caseMatch: true };
 	// Case-insensitive fallback for N005 warn.
 	const lower = raw.toLowerCase();
 	for (const known of Object.keys(CLASS_TOKENS)) {
 		if (known.toLowerCase() === lower) return { token: known, caseMatch: false };
+	}
+	for (const known of Object.keys(EXTRA_TOKENS)) {
+		if (known.toLowerCase() === lower) return { token: known, caseMatch: false, custom: true };
 	}
 	for (const alias of Object.keys(ALIASES)) {
 		if (alias.toLowerCase() === lower) return { token: ALIASES[alias], caseMatch: false };
@@ -83,7 +124,8 @@ export function resolveToken(raw) {
 
 export function isTextClass(cls) {
 	if (!cls) return false;
-	return TEXT_CLASSES.has(cls);
+	if (TEXT_CLASSES.has(cls)) return true;
+	return EXTRA_TEXT_CLASSES.has(cls);
 }
 
 // --self-test

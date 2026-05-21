@@ -17,10 +17,11 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve, join, dirname, basename, extname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { CLASS_TOKENS, isTextClass } from './shared/class-tokens.mjs';
+import { CLASS_TOKENS, extendTokens, getTokenSpec, isTextClass } from './shared/class-tokens.mjs';
 import { figmaToScene, extractTint, degToRad } from './shared/coord-resolve.mjs';
 import { resolveTextureBase } from './shared/texture-base.mjs';
 import { readConnectMap, findMapping, resolveVariant } from './shared/connect-map.mjs';
+import { loadRegistry } from './shared/project-class-registry.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -40,6 +41,18 @@ const dry = flagPresent('--dry');
 if (!figmaPath || !outPath) {
 	console.error('usage: generate-skeleton.mjs --figma <snapshot.json> --out <path> [--prefab] [--project <path>] [--connect <path>] [--root-class <class>] [--orientation portrait|landscape] [--dry]');
 	process.exit(2);
+}
+
+// Inject custom class tokens BEFORE walking figma so layer.classTag for things
+// like [CardItem] gets resolved instead of falling to N002 + Container fallback.
+let registry = null;
+if (projectRoot) {
+	try {
+		registry = loadRegistry(projectRoot);
+		extendTokens(registry);
+	} catch (e) {
+		console.error(`warn: failed to load class registry: ${e.message}`);
+	}
 }
 
 const figmaSnap = ensureWalkedFigma(figmaPath);
@@ -133,7 +146,7 @@ function buildNode(layer, parentLayer, isRoot) {
 	}
 
 	// Unknown / no class → emit Container as fallback
-	const tokenSpec = CLASS_TOKENS[classTag];
+	const tokenSpec = getTokenSpec(classTag);
 	if (!tokenSpec) {
 		todos.push({
 			priority: 'high',
@@ -142,6 +155,12 @@ function buildNode(layer, parentLayer, isRoot) {
 		});
 		return buildContainerNode(layer, parentLayer);
 	}
+
+	// Custom classes from project registry: emit with class name preserved and
+	// inheritance chain logged so the author knows what built-in ancestor it
+	// derives from. @editable fields (data-paths, callbacks, DI tokens) aren't
+	// auto-filled — that needs Phase 2 of the registry parsing @editable blocks.
+	const isCustomClass = tokenSpec.custom === true;
 
 	// Build geometry
 	const parentBox = parentLayer?.bbox || figmaSnap.root?.bbox || { x: 0, y: 0 };
@@ -231,6 +250,15 @@ function buildNode(layer, parentLayer, isRoot) {
 				message: `${layer.path} → [Spine] timeline cannot be generated. Author in editor.`
 			});
 			break;
+	}
+
+	if (isCustomClass) {
+		const chainStr = tokenSpec.chain ? tokenSpec.chain.join(' -> ') : classTag;
+		todos.push({
+			priority: 'medium',
+			level: 'custom',
+			message: `${layer.path} → custom class ${classTag} (chain: ${chainStr}). x/y/scale derived from ancestry; @editable fields (data-paths, callbacks, DI tokens) require manual review.`
+		});
 	}
 
 	// Common position props
@@ -485,7 +513,9 @@ function ensureWalkedFigma(path) {
 	const raw = JSON.parse(readFileSync(resolve(path), 'utf8'));
 	if (raw.layers) return raw;
 	const walkerPath = join(__dirname, 'figma-walker.mjs');
-	const res = spawnSync('node', [walkerPath, resolve(path)], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
+	const walkerArgs = [walkerPath, resolve(path)];
+	if (projectRoot) walkerArgs.push('--project', resolve(projectRoot));
+	const res = spawnSync('node', walkerArgs, { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
 	if (res.status !== 0) {
 		console.error(`failed to walk figma snapshot: ${res.stderr}`);
 		process.exit(2);

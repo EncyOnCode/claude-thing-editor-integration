@@ -10,21 +10,37 @@
 // Output: { fileKey?, nodeId?, root?, layers: { figmaPath: { id, name, type, classTag, identifier, meta, bbox, ..., classifyErrors: [...] } } }
 //
 // Usage:
-//   node figma-walker.mjs <snapshot.json> [--json <out.json>]
+//   node figma-walker.mjs <snapshot.json> [--json <out.json>] [--project <root>]
+//
+// --project loads the class registry and registers custom class tokens so layer
+// names like [CardItem] or [AnimatedLayoutGroup] resolve instead of emitting
+// N002 "unknown class token". Required only when projects use custom classes;
+// for engine/lib-only tags it is optional.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseLayerName, inferClass } from './shared/figma-classify.mjs';
-import { CLASS_TOKENS } from './shared/class-tokens.mjs';
+import { CLASS_TOKENS, extendTokens } from './shared/class-tokens.mjs';
+import { loadRegistry } from './shared/project-class-registry.mjs';
 
 const args = process.argv.slice(2);
 const flagJsonIdx = args.indexOf('--json');
 const jsonOut = flagJsonIdx >= 0 ? args[flagJsonIdx + 1] : null;
-const inputFile = args.find(a => !a.startsWith('--') && a !== jsonOut);
+const projectIdx = args.indexOf('--project');
+const projectRoot = projectIdx >= 0 ? args[projectIdx + 1] : null;
+const inputFile = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--json' && args[i - 1] !== '--project');
 
 if (!inputFile) {
-	console.error('usage: figma-walker.mjs <snapshot.json> [--json <out.json>]');
+	console.error('usage: figma-walker.mjs <snapshot.json> [--json <out.json>] [--project <root>]');
 	process.exit(1);
+}
+
+if (projectRoot) {
+	try {
+		extendTokens(loadRegistry(projectRoot));
+	} catch (e) {
+		console.error(`warn: failed to load class registry from ${projectRoot}: ${e.message}`);
+	}
 }
 
 const raw = JSON.parse(readFileSync(resolve(inputFile), 'utf8'));

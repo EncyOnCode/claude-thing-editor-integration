@@ -22,25 +22,39 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { extendTokens, isLayoutManaged, isTextClass as registryIsTextClass } from './shared/class-tokens.mjs';
+import { loadRegistry } from './shared/project-class-registry.mjs';
 
 const TEXT_CLASS_RE = /(^|[^A-Za-z])(Text|BitmapText|HTMLText)([^A-Za-z]|$)/;
 const SCALE_PROPS = new Set(['scale.x', 'scale.y', 'scale']);
 const POSITION_PROPS = new Set(['x', 'y']);
 const PIVOT_PROPS = new Set(['pivot.x', 'pivot.y']);
 const SIZE_PROPS = new Set(['width', 'height']);
-const LAYOUT_MANAGED_PARENT_CLASSES = new Set(['LayoutGroup', 'LayoutGrid', 'Resizer']);
 const OVERRIDING_SIZE_MODES = new Set(['both', 'stretch', 'shrink']);
 
 const args = process.argv.slice(2);
 const flags = new Set(args.filter(a => a.startsWith('--')));
-const positional = args.filter(a => !a.startsWith('--'));
+const projectIdx = args.indexOf('--project');
+const projectRoot = projectIdx >= 0 ? args[projectIdx + 1] : null;
+const positional = args.filter((a, i) => !a.startsWith('--') && args[i - 1] !== '--project');
 const [scenePath, patchPath] = positional;
 const dry = flags.has('--dry');
 const force = flags.has('--force');
 
 if (!scenePath || !patchPath) {
-	console.error('usage: apply-patch.mjs <scene.json> <patch.json> [--dry] [--force]');
+	console.error('usage: apply-patch.mjs <scene.json> <patch.json> [--dry] [--force] [--project <root>]');
 	process.exit(1);
+}
+
+// Optional registry — extends isLayoutManaged() and isTextClass() so refuse
+// rules catch custom LayoutGroup/Resizer/Text subclasses (e.g. AnimatedLayoutGroup
+// extends LayoutGroup extends Shape) that the hardcoded sets miss.
+if (projectRoot) {
+	try {
+		extendTokens(loadRegistry(projectRoot));
+	} catch (e) {
+		console.error(`warn: failed to load class registry from ${projectRoot}: ${e.message}`);
+	}
 }
 
 const sceneAbs = resolve(scenePath);
@@ -123,6 +137,9 @@ function fmtPath(p) {
 
 function isTextClass(cls) {
 	if (!cls) return false;
+	// Registry-aware (catches custom subclasses of Text/BitmapText/HTMLText) with
+	// regex fallback for callers running without --project.
+	if (registryIsTextClass(cls)) return true;
 	return TEXT_CLASS_RE.test(cls);
 }
 
@@ -160,7 +177,7 @@ function guardScale(node) {
 // x/y guard — refuse if engine overwrites position.
 function guardPosition(prop, node, parent) {
 	const parentClass = parent?.c ?? null;
-	if (parentClass && LAYOUT_MANAGED_PARENT_CLASSES.has(parentClass)) {
+	if (parentClass && isLayoutManaged(parentClass)) {
 		return {
 			blocked: true,
 			code: 'layout-managed-position',

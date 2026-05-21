@@ -10,8 +10,9 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { CLASS_TOKENS } from './shared/class-tokens.mjs';
+import { CLASS_TOKENS, extendTokens, getTokenSpec } from './shared/class-tokens.mjs';
 import { parseLayerName, validateMeta } from './shared/figma-classify.mjs';
+import { loadRegistry } from './shared/project-class-registry.mjs';
 import { mdValidatorReport, summarizeFindings } from './shared/report-format.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -32,6 +33,17 @@ const jsonOut = flagValue('--json');
 if (!figmaPath) {
 	console.error('usage: naming-validator.mjs --figma <snapshot.json> [--scene <scene.json>] [--project <path>] [--json <out.json>]');
 	process.exit(1);
+}
+
+// Register custom class tokens before walking the figma snapshot. Without this,
+// [CardItem]/[AnimatedLayoutGroup]/etc would emit N002 "unknown token". Also
+// forwarded to the figma-walker subprocess so its classifyErrors agree.
+if (projectRoot) {
+	try {
+		extendTokens(loadRegistry(projectRoot));
+	} catch (e) {
+		console.error(`warn: failed to load class registry: ${e.message}`);
+	}
 }
 
 const figmaSnap = ensureWalkedSnapshot(figmaPath);
@@ -90,7 +102,7 @@ for (const layer of Object.values(figmaSnap.layers || {})) {
 	// M-series: meta validation (skip special tokens that don't have meta requirements)
 	if (layer.classTag && layer.classTag !== 'ref' && layer.classTag !== 'Prefab') {
 		// Special tokens are handled separately; otherwise validate against tokenSpec
-		const spec = CLASS_TOKENS[layer.classTag];
+		const spec = getTokenSpec(layer.classTag);
 		if (spec) {
 			const metaErrors = validateMeta(layer.classTag, layer.meta || {}, spec);
 			for (const e of metaErrors) {
@@ -293,9 +305,10 @@ function ensureWalkedSnapshot(path) {
 	// Accept either a pre-walked snapshot (has `.layers`) or a raw Figma tree.
 	const raw = JSON.parse(readFileSync(resolve(path), 'utf8'));
 	if (raw.layers) return raw;
-	// Otherwise call figma-walker.mjs internally to produce one.
 	const walkerPath = join(__dirname, 'figma-walker.mjs');
-	const res = spawnSync('node', [walkerPath, resolve(path)], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
+	const walkerArgs = [walkerPath, resolve(path)];
+	if (projectRoot) walkerArgs.push('--project', resolve(projectRoot));
+	const res = spawnSync('node', walkerArgs, { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
 	if (res.status !== 0) {
 		console.error(`failed to walk figma snapshot: ${res.stderr}`);
 		process.exit(1);
@@ -304,9 +317,10 @@ function ensureWalkedSnapshot(path) {
 }
 
 function loadSceneFlat(path) {
-	// Use scene-walker via subprocess
 	const walkerPath = join(__dirname, 'scene-walker.mjs');
-	const res = spawnSync('node', [walkerPath, resolve(path)], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
+	const walkerArgs = [walkerPath, resolve(path)];
+	if (projectRoot) walkerArgs.push('--project', resolve(projectRoot));
+	const res = spawnSync('node', walkerArgs, { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
 	if (res.status !== 0) {
 		console.error(`failed to walk scene: ${res.stderr}`);
 		return null;

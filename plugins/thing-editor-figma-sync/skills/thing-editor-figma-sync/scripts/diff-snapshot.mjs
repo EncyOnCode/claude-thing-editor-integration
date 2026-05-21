@@ -21,7 +21,8 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mdDiffReport, jsonReport } from './shared/report-format.mjs';
 import { readConnectMap, findMapping } from './shared/connect-map.mjs';
-import { isTextClass } from './shared/class-tokens.mjs';
+import { extendTokens, isTextClass } from './shared/class-tokens.mjs';
+import { loadRegistry } from './shared/project-class-registry.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -38,6 +39,7 @@ const connectPath = flagValue('--connect');
 const reportJsonPath = flagValue('--report-json');
 const patchOutPath = flagValue('--patch-out');
 const screenshotPath = flagValue('--screenshot');
+const projectRoot = flagValue('--project');
 const autoApply = flagPresent('--auto-apply');
 const strict = flagPresent('--strict');
 const thrPx = strict ? 0 : (Number(flagValue('--threshold-px')) || 1);
@@ -46,8 +48,16 @@ const thrRotDeg = strict ? 0 : (Number(flagValue('--threshold-rot')) || 1);
 const thrRotRad = (thrRotDeg * Math.PI) / 180;
 
 if (!figmaPath || !scenePath) {
-	console.error('usage: diff-snapshot.mjs --figma <snapshot.json> --scene <scene.json> [options]');
+	console.error('usage: diff-snapshot.mjs --figma <snapshot.json> --scene <scene.json> [options] [--project <root>]');
 	process.exit(2);
+}
+
+if (projectRoot) {
+	try {
+		extendTokens(loadRegistry(projectRoot));
+	} catch (e) {
+		console.error(`warn: failed to load class registry: ${e.message}`);
+	}
 }
 
 // Workflow D acknowledgement
@@ -323,15 +333,16 @@ if (autoApply) {
 	}
 	const patchTmp = patchOutPath || join(dirname(resolve(scenePath)), '.diff-patches.json');
 	writeFileSync(patchTmp, JSON.stringify(patches, null, 2));
-	// Dry first
 	const applyPath = join(__dirname, 'apply-patch.mjs');
-	const dryRes = spawnSync('node', [applyPath, resolve(scenePath), patchTmp, '--dry'], { encoding: 'utf8' });
+	const applyArgs = [applyPath, resolve(scenePath), patchTmp];
+	if (projectRoot) applyArgs.push('--project', resolve(projectRoot));
+	const dryRes = spawnSync('node', [...applyArgs, '--dry'], { encoding: 'utf8' });
 	console.error(dryRes.stdout);
 	if (dryRes.status !== 0) {
 		console.error(`dry-run failed (exit ${dryRes.status}); aborting auto-apply`);
 		process.exit(1);
 	}
-	const realRes = spawnSync('node', [applyPath, resolve(scenePath), patchTmp], { encoding: 'utf8' });
+	const realRes = spawnSync('node', applyArgs, { encoding: 'utf8' });
 	console.error(realRes.stdout);
 	if (realRes.status !== 0) {
 		console.error(`apply failed (exit ${realRes.status})`);
@@ -347,7 +358,9 @@ function ensureWalkedFigma(path) {
 	const raw = JSON.parse(readFileSync(resolve(path), 'utf8'));
 	if (raw.layers) return raw;
 	const walkerPath = join(__dirname, 'figma-walker.mjs');
-	const res = spawnSync('node', [walkerPath, resolve(path)], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
+	const walkerArgs = [walkerPath, resolve(path)];
+	if (projectRoot) walkerArgs.push('--project', resolve(projectRoot));
+	const res = spawnSync('node', walkerArgs, { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
 	if (res.status !== 0) {
 		console.error(`failed to walk figma snapshot: ${res.stderr}`);
 		process.exit(2);
@@ -357,7 +370,9 @@ function ensureWalkedFigma(path) {
 
 function loadSceneFlat(path) {
 	const walkerPath = join(__dirname, 'scene-walker.mjs');
-	const res = spawnSync('node', [walkerPath, resolve(path)], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
+	const walkerArgs = [walkerPath, resolve(path)];
+	if (projectRoot) walkerArgs.push('--project', resolve(projectRoot));
+	const res = spawnSync('node', walkerArgs, { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
 	if (res.status !== 0) {
 		console.error(`failed to walk scene: ${res.stderr}`);
 		process.exit(2);
