@@ -481,12 +481,26 @@ function diffPositionEngineTruth(figma, sceneNode, sceneFlat, rootFrame, designS
 		const useWorld = !!sceneNode.resizeEngine?.useWorld;
 		const parentWorldX = parentEntry?.world?.x ?? 0;
 		const parentWorldY = parentEntry?.world?.y ?? 0;
+		// Engine's resize formula references the parent's OWN width/height, not
+		// its recursive subtree bounds. Engine snapshot now exports localEngine
+		// .width/.height for containers that have it. Fallback chain:
+		//   1. parent.localEngine.width (engine-truth own width)
+		//   2. parent.props.width (authored)
+		//   3. parent.localEngine.pivot.x × 2 (heuristic: SizedContainer pivot
+		//      defaults to center, so center × 2 ≈ width)
+		//   4. game.W (when useWorld=true OR all else fails)
 		const parentWidth = useWorld
 			? engineMeta.gameSize.W
-			: (parentEntry?.world?.bounds?.width ?? engineMeta.gameSize.W);
+			: (parentEntry?.localEngine?.width
+				?? parentEntry?.props?.width
+				?? (parentEntry?.localEngine?.pivotX != null ? parentEntry.localEngine.pivotX * 2 : null)
+				?? engineMeta.gameSize.W);
 		const parentHeight = useWorld
 			? engineMeta.gameSize.H
-			: (parentEntry?.world?.bounds?.height ?? engineMeta.gameSize.H);
+			: (parentEntry?.localEngine?.height
+				?? parentEntry?.props?.height
+				?? (parentEntry?.localEngine?.pivotY != null ? parentEntry.localEngine.pivotY * 2 : null)
+				?? engineMeta.gameSize.H);
 		const normAnchorX = sceneNode.resizeEngine?.normAnchorX ?? 0;
 		const normAnchorY = sceneNode.resizeEngine?.normAnchorY ?? 0;
 		const newNormalizePosX = (targetWorldX - parentWorldX) - parentWidth * normAnchorX;
