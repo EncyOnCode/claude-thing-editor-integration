@@ -16,12 +16,12 @@
 // Exit codes: 0 success, 1 if any 'refuse' severity diffs.
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { resolve, join, dirname } from 'node:path';
+import { resolve, join, dirname, basename } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mdDiffReport, jsonReport } from './shared/report-format.mjs';
 import { readConnectMap, findMapping } from './shared/connect-map.mjs';
-import { extendTokens, isTextClass } from './shared/class-tokens.mjs';
+import { extendTokens, isLayoutManaged, isTextClass } from './shared/class-tokens.mjs';
 import { loadRegistry } from './shared/project-class-registry.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -73,6 +73,22 @@ if (screenshotPath) {
 const figmaSnap = ensureWalkedFigma(figmaPath);
 const sceneFlat = loadSceneFlat(scenePath);
 const connectMap = connectPath ? readConnectMap(connectPath) : null;
+
+// Engine snapshot metadata (gameSize, orientation) — separate from per-node
+// data that scene-walker already merges. We read the snapshot file directly
+// here to derive design-scale calibration; per-node `world`/`localEngine`/
+// `resizeEngine` come through sceneFlat entries.
+const engineMeta = loadEngineSnapshotMeta(projectRoot, scenePath);
+const figmaRootFrame = findFigmaRootFrame(figmaSnap);
+const designScale = (figmaRootFrame?.bbox?.width && engineMeta?.gameSize?.W)
+	? engineMeta.gameSize.W / figmaRootFrame.bbox.width
+	: 1;
+const haveEngineTruth = !!engineMeta && !!figmaRootFrame;
+if (haveEngineTruth) {
+	console.error(`info: engine truth available — gameSize ${engineMeta.gameSize.W}×${engineMeta.gameSize.H}, figma frame ${figmaRootFrame.bbox.width}×${figmaRootFrame.bbox.height}, designScale ${designScale.toFixed(4)}`);
+} else if (projectRoot) {
+	console.error(`info: engine snapshot or figma root frame missing — falling back to naive computeFigmaLocal coord math`);
+}
 
 // Build matches
 const matches = [];
@@ -143,47 +159,16 @@ for (const { figma, scene } of matches) {
 		});
 	}
 
-	// Coordinate diff (x, y, scale, rotation, alpha, tint, text)
-	const sceneX = sceneProps.x ?? 0;
-	const sceneY = sceneProps.y ?? 0;
-	const figmaX = figmaBbox.x; // absolute Figma coord
-	const figmaY = figmaBbox.y;
-
-	// Approximate: scene origin in Figma coord space requires knowing root + parent offsets.
-	// For per-node diff we compare deltas in matched coordinate frame.
-	// User expects diff to show "Figma says X, scene has Y". The translator role belongs to apply-patch derivation; here we report raw.
-	// To be useful: compute scene-local Figma position by subtracting parent figma origin (if matched).
-	const figmaLocal = computeFigmaLocal(figma, figmaSnap);
-	const figmaLocalX = figmaLocal.x;
-	const figmaLocalY = figmaLocal.y;
-
-	// x diff
-	if (Math.abs(sceneX - figmaLocalX) > thrPx) {
-		diffs.push({
-			scenePath: sceneNode.path,
-			prop: 'x',
-			from: sceneX,
-			to: round(figmaLocalX),
-			delta: round(figmaLocalX - sceneX),
-			severity: 'patch',
-			reason: `Figma local x = ${round(figmaLocalX)}, scene = ${sceneX}`
-		});
-	}
-	// y diff
-	if (Math.abs(sceneY - figmaLocalY) > thrPx) {
-		const isCenterCenterText = isTextClass(sceneNode.class) && figma.style?.textAlignVertical === 'CENTER';
-		diffs.push({
-			scenePath: sceneNode.path,
-			prop: 'y',
-			from: sceneY,
-			to: round(figmaLocalY),
-			delta: round(figmaLocalY - sceneY),
-			severity: isCenterCenterText ? 'skip' : 'patch',
-			reason: isCenterCenterText
-				? 'Text center/center Y derivation unreliable from Figma — verify visually'
-				: `Figma local y = ${round(figmaLocalY)}, scene = ${sceneY}`
-		});
-	}
+	// Coordinate diff. Two code paths:
+	// (1) engine-truth: per-node `world.*` from snapshot — anchor-aware, scale-
+	//     calibrated, respects Resizer/LayoutGroup-derived positions.
+	// (2) naive computeFigmaLocal — parent-subtract heuristic, used as fallback
+	//     when no engine snapshot is available. Inaccurate under Resizer or
+	//     parent-scale chains.
+	const positionDiffs = haveEngineTruth && sceneNode.world
+		? diffPositionEngineTruth(figma, sceneNode, sceneFlat, figmaRootFrame, designScale, engineMeta, thrPx)
+		: diffPositionNaive(figma, sceneNode, sceneProps, figmaSnap, thrPx);
+	for (const d of positionDiffs) diffs.push(d);
 
 	// rotation
 	const figmaRot = (figma.rotation || 0) * Math.PI / 180;
@@ -427,6 +412,224 @@ function computeFigmaLocal(figmaLayer, figmaSnap) {
 		parentY = figmaSnap.root.bbox.y;
 	}
 	return { x: bbox.x - parentX, y: bbox.y - parentY };
+}
+
+// Engine-truth coord diff. Compares Figma anchor-point (in design-frame-local
+// space, scaled to engine pixels) against engine worldTransform.tx/ty. Patch
+// target selection depends on parent class and self resize state:
+//   - parent is layout-managed (LayoutGroup/Resizer/custom subclasses) → refuse
+//     with hint to tune parent layout params
+//   - self has canOverridePivotAndAnchor=true → emit normalizePosX/Y best-effort
+//     patches (preserves existing normAnchor, shifts pixel offset)
+//   - otherwise → emit local x/y patches: newLocal = oldLocal + worldDelta
+//     (assumes parent has no scale/rotation chain; phase 2C generalizes)
+function diffPositionEngineTruth(figma, sceneNode, sceneFlat, rootFrame, designScale, engineMeta, thrPx) {
+	const out = [];
+	const figmaBbox = figma.bbox;
+	if (!figmaBbox) return out;
+
+	const anchorX = sceneNode.localEngine?.anchor?.x ?? 0;
+	const anchorY = sceneNode.localEngine?.anchor?.y ?? 0;
+	const figmaAnchorPointX = (figmaBbox.x - rootFrame.bbox.x) + figmaBbox.width * anchorX;
+	const figmaAnchorPointY = (figmaBbox.y - rootFrame.bbox.y) + figmaBbox.height * anchorY;
+	const targetWorldX = figmaAnchorPointX * designScale;
+	const targetWorldY = figmaAnchorPointY * designScale;
+	const currentWorldX = sceneNode.world.x;
+	const currentWorldY = sceneNode.world.y;
+	const deltaX = targetWorldX - currentWorldX;
+	const deltaY = targetWorldY - currentWorldY;
+
+	const parentEntry = findParentSceneEntry(sceneFlat, sceneNode.path);
+	const parentLayoutManaged = parentEntry ? isLayoutManaged(parentEntry.class) : false;
+	const canOverride = !!sceneNode.resizeEngine?.canOverridePivotAndAnchor;
+
+	const reason = (axis, target, current) =>
+		`engine-truth: figma anchor-point ${axis}=${round(axis === 'x' ? figmaAnchorPointX : figmaAnchorPointY)} (×${designScale.toFixed(4)} → ${round(target)}); engine world ${axis}=${round(current)}; Δ=${round(target - current)}px`;
+
+	if (parentLayoutManaged) {
+		if (Math.abs(deltaX) > thrPx) {
+			out.push({
+				scenePath: sceneNode.path,
+				prop: 'x',
+				from: sceneNode.localEngine?.x ?? 0,
+				to: null,
+				delta: round(deltaX),
+				severity: 'refuse',
+				reason: reason('x', targetWorldX, currentWorldX),
+				hint: `parent "${parentEntry.class}" overwrites child x in layoutChildren(); tune parent spacingX / paddingLeft / aligmentX instead`
+			});
+		}
+		if (Math.abs(deltaY) > thrPx) {
+			out.push({
+				scenePath: sceneNode.path,
+				prop: 'y',
+				from: sceneNode.localEngine?.y ?? 0,
+				to: null,
+				delta: round(deltaY),
+				severity: 'refuse',
+				reason: reason('y', targetWorldY, currentWorldY),
+				hint: `parent "${parentEntry.class}" overwrites child y in layoutChildren(); tune parent spacingY / paddingTop / aligmentY instead`
+			});
+		}
+		return out;
+	}
+
+	if (canOverride) {
+		// Resizer engine formula (resize-attrib.ts): targetWorldPos =
+		// parentWorldOrigin + parentSize × normAnchor + normalizePos.
+		// useWorld=true means parentSize references game.W/H instead of parent bounds.
+		const useWorld = !!sceneNode.resizeEngine?.useWorld;
+		const parentWorldX = parentEntry?.world?.x ?? 0;
+		const parentWorldY = parentEntry?.world?.y ?? 0;
+		const parentWidth = useWorld
+			? engineMeta.gameSize.W
+			: (parentEntry?.world?.bounds?.width ?? engineMeta.gameSize.W);
+		const parentHeight = useWorld
+			? engineMeta.gameSize.H
+			: (parentEntry?.world?.bounds?.height ?? engineMeta.gameSize.H);
+		const normAnchorX = sceneNode.resizeEngine?.normAnchorX ?? 0;
+		const normAnchorY = sceneNode.resizeEngine?.normAnchorY ?? 0;
+		const newNormalizePosX = (targetWorldX - parentWorldX) - parentWidth * normAnchorX;
+		const newNormalizePosY = (targetWorldY - parentWorldY) - parentHeight * normAnchorY;
+		const curNormalizePosX = sceneNode.props?.normalizePosX ?? 0;
+		const curNormalizePosY = sceneNode.props?.normalizePosY ?? 0;
+
+		if (Math.abs(deltaX) > thrPx) {
+			out.push({
+				scenePath: sceneNode.path,
+				prop: 'normalizePosX',
+				from: curNormalizePosX,
+				to: round(newNormalizePosX),
+				delta: round(newNormalizePosX - curNormalizePosX),
+				severity: 'patch',
+				reason: reason('x', targetWorldX, currentWorldX) +
+					`; canOverride=true → patching normalizePosX (parentW=${round(parentWidth)}, normAnchorX=${normAnchorX})`,
+				confidence: useWorld ? 'high' : 'approximate'
+			});
+		}
+		if (Math.abs(deltaY) > thrPx) {
+			out.push({
+				scenePath: sceneNode.path,
+				prop: 'normalizePosY',
+				from: curNormalizePosY,
+				to: round(newNormalizePosY),
+				delta: round(newNormalizePosY - curNormalizePosY),
+				severity: 'patch',
+				reason: reason('y', targetWorldY, currentWorldY) +
+					`; canOverride=true → patching normalizePosY (parentH=${round(parentHeight)}, normAnchorY=${normAnchorY})`,
+				confidence: useWorld ? 'high' : 'approximate'
+			});
+		}
+		return out;
+	}
+
+	// Plain x/y patch on local coords. Assumes parent has no scale/rotation chain.
+	const currentLocalX = sceneNode.localEngine?.x ?? sceneNode.props?.x ?? 0;
+	const currentLocalY = sceneNode.localEngine?.y ?? sceneNode.props?.y ?? 0;
+	const newLocalX = currentLocalX + deltaX;
+	const newLocalY = currentLocalY + deltaY;
+
+	if (Math.abs(deltaX) > thrPx) {
+		out.push({
+			scenePath: sceneNode.path,
+			prop: 'x',
+			from: sceneNode.props?.x ?? 0,
+			to: round(newLocalX),
+			delta: round(deltaX),
+			severity: 'patch',
+			reason: reason('x', targetWorldX, currentWorldX)
+		});
+	}
+	if (Math.abs(deltaY) > thrPx) {
+		const isCenterCenterText = isTextClass(sceneNode.class) && figma.style?.textAlignVertical === 'CENTER';
+		out.push({
+			scenePath: sceneNode.path,
+			prop: 'y',
+			from: sceneNode.props?.y ?? 0,
+			to: round(newLocalY),
+			delta: round(deltaY),
+			severity: isCenterCenterText ? 'skip' : 'patch',
+			reason: isCenterCenterText
+				? 'Text center/center Y derivation unreliable from Figma — verify visually'
+				: reason('y', targetWorldY, currentWorldY)
+		});
+	}
+	return out;
+}
+
+// Legacy naive coord math. Kept for projects without an engine snapshot.
+function diffPositionNaive(figma, sceneNode, sceneProps, figmaSnap, thrPx) {
+	const out = [];
+	const sceneX = sceneProps.x ?? 0;
+	const sceneY = sceneProps.y ?? 0;
+	const figmaLocal = computeFigmaLocal(figma, figmaSnap);
+	if (Math.abs(sceneX - figmaLocal.x) > thrPx) {
+		out.push({
+			scenePath: sceneNode.path,
+			prop: 'x',
+			from: sceneX,
+			to: round(figmaLocal.x),
+			delta: round(figmaLocal.x - sceneX),
+			severity: 'patch',
+			reason: `naive: figma local x = ${round(figmaLocal.x)}, scene = ${sceneX} (engine snapshot unavailable)`
+		});
+	}
+	if (Math.abs(sceneY - figmaLocal.y) > thrPx) {
+		const isCenterCenterText = isTextClass(sceneNode.class) && figma.style?.textAlignVertical === 'CENTER';
+		out.push({
+			scenePath: sceneNode.path,
+			prop: 'y',
+			from: sceneY,
+			to: round(figmaLocal.y),
+			delta: round(figmaLocal.y - sceneY),
+			severity: isCenterCenterText ? 'skip' : 'patch',
+			reason: isCenterCenterText
+				? 'Text center/center Y derivation unreliable from Figma — verify visually'
+				: `naive: figma local y = ${round(figmaLocal.y)}, scene = ${sceneY} (engine snapshot unavailable)`
+		});
+	}
+	return out;
+}
+
+function findFigmaRootFrame(figmaSnap) {
+	if (figmaSnap?.root?.bbox) return figmaSnap.root;
+	const layers = figmaSnap?.layers ?? {};
+	for (const layer of Object.values(layers)) {
+		if (!layer.parentPath && layer.bbox) return layer;
+	}
+	// Fallback: shortest-path layer with a bbox.
+	let best = null;
+	for (const layer of Object.values(layers)) {
+		if (!layer.bbox) continue;
+		if (!best || (layer.path?.length ?? 0) < (best.path?.length ?? Infinity)) best = layer;
+	}
+	return best;
+}
+
+function loadEngineSnapshotMeta(projectRoot, sceneFile) {
+	if (!projectRoot || !sceneFile) return null;
+	const sceneName = basename(sceneFile).replace(/\.(s|p)\.json$/, '');
+	const path = join(resolve(projectRoot), '.thing-editor-meta', 'snapshots', sceneName + '.json');
+	if (!existsSync(path)) return null;
+	try {
+		const snap = JSON.parse(readFileSync(path, 'utf8'));
+		return {
+			gameSize: snap.gameSize,
+			orientation: snap.orientation,
+			generatedAt: snap.generatedAt
+		};
+	} catch {
+		return null;
+	}
+}
+
+function findParentSceneEntry(sceneFlat, scenePath) {
+	if (!scenePath || scenePath.length < 2) return null;
+	const parentPath = scenePath.slice(0, -2);
+	for (const entry of Object.values(sceneFlat)) {
+		if (Array.isArray(entry.path) && arrayEq(entry.path, parentPath)) return entry;
+	}
+	return null;
 }
 
 function extractTintFromFills(fills) {
