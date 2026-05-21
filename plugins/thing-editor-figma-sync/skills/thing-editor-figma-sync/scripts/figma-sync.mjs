@@ -103,7 +103,9 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 		console.error('-> fetching Figma data');
 		const figmaJsonPath = `/tmp/figma-sync-${sceneName}.json`;
 		const figmaPngPath = `/tmp/figma-sync-${sceneName}.png`;
-		const figmaUrl = `https://www.figma.com/design/${syncConfig.fileKey}/?node-id=${sceneCfg.nodeId.replace(':', '-')}`;
+		// fetch-figma.mjs URL regex needs a non-empty path segment after the
+		// fileKey (matches the slug Figma puts there for shareable URLs).
+		const figmaUrl = `https://www.figma.com/design/${syncConfig.fileKey}/proj?node-id=${sceneCfg.nodeId.replace(':', '-')}`;
 
 		const fetchJson = runNode('fetch-figma.mjs', ['--url', figmaUrl], { stdio: ['ignore', 'pipe', 'pipe'] });
 		if (fetchJson.code !== 0) throw new Error(`fetch-figma failed: ${fetchJson.stderr}`);
