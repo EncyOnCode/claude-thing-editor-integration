@@ -51,6 +51,52 @@ const screenshotPath = flagValue('--screenshot');
 const verifyScreenshot = flagPresent('--verify-screenshot');
 const figmaImagePath = flagValue('--figma-image');
 const ssimThreshold = Number(flagValue('--ssim-threshold')) || 0.95;
+
+// Exclusion rules — same CLI shape as compare-screenshots.mjs for consistency.
+// --exclude-class    comma-separated class names; matches if scene.class OR any
+//                    class in scene.chain equals one of these.
+// --exclude-pattern  JS regex tested against scene.namePath (single regex).
+// --exclude-scene-paths  JSON array-of-arrays; each inner array is a scenePath
+//                    prefix — any scene whose path starts with it is excluded
+//                    (excludes the whole subtree).
+const excludeClassesStr = flagValue('--exclude-class');
+const excludePatternStr = flagValue('--exclude-pattern');
+const excludeScenePathsStr = flagValue('--exclude-scene-paths');
+const excludeClasses = excludeClassesStr ? new Set(excludeClassesStr.split(',').map(s => s.trim()).filter(Boolean)) : null;
+const excludePattern = excludePatternStr ? new RegExp(excludePatternStr) : null;
+let excludeScenePaths = null;
+if (excludeScenePathsStr) {
+	try {
+		const parsed = JSON.parse(excludeScenePathsStr);
+		if (Array.isArray(parsed)) excludeScenePaths = parsed.filter(p => Array.isArray(p));
+	} catch (e) {
+		console.error(`warn: --exclude-scene-paths is not valid JSON, ignoring: ${e.message}`);
+	}
+}
+
+function isExcludedSceneNode(sceneEntry) {
+	if (excludeClasses) {
+		if (excludeClasses.has(sceneEntry.class)) return { excluded: true, reason: `class:${sceneEntry.class}` };
+		const chain = Array.isArray(sceneEntry.chain) ? sceneEntry.chain : [];
+		for (const c of chain) {
+			if (excludeClasses.has(c)) return { excluded: true, reason: `chain:${c}` };
+		}
+	}
+	if (excludePattern && typeof sceneEntry.namePath === 'string') {
+		if (excludePattern.test(sceneEntry.namePath)) return { excluded: true, reason: `pattern:/${excludePattern.source}/` };
+	}
+	if (excludeScenePaths && Array.isArray(sceneEntry.path)) {
+		for (const prefix of excludeScenePaths) {
+			if (prefix.length > sceneEntry.path.length) continue;
+			let matches = true;
+			for (let i = 0; i < prefix.length; i++) {
+				if (prefix[i] !== sceneEntry.path[i]) { matches = false; break; }
+			}
+			if (matches) return { excluded: true, reason: `scene-path-prefix:${JSON.stringify(prefix)}` };
+		}
+	}
+	return { excluded: false };
+}
 const projectRoot = flagValue('--project');
 const tokensPath = flagValue('--tokens');
 const autoApply = flagPresent('--auto-apply');
@@ -243,10 +289,26 @@ for (const p of proposals) {
 }
 
 // Materialize matches in figma-layer order.
+let excludedMatches = 0;
 for (const p of proposals) {
 	const chosen = layerAssigned.get(p.layer.id);
 	if (!chosen) {
 		unmatchedFigma.push({ figmaId: p.layer.id, name: p.layer.name, type: p.layer.type });
+		continue;
+	}
+	// User-declared exclusion rules — surface match but skip diff emission. Keeps
+	// the chosen layer claimed (so it doesn't reappear as figmaOnly noise) and
+	// lets the report surface the EXCLUDED_DYNAMIC flag for visibility.
+	const exclusion = isExcludedSceneNode(chosen.entry);
+	if (exclusion.excluded) {
+		excludedMatches++;
+		flags.push({
+			scenePath: chosen.entry.path,
+			code: 'EXCLUDED_DYNAMIC',
+			level: 'info',
+			message: `excluded "${chosen.namePath}" (${exclusion.reason})`
+		});
+		unmatchedScene.delete(chosen.key);
 		continue;
 	}
 	matches.push({
@@ -399,13 +461,15 @@ for (const { figma, scene } of matches) {
 // Build summary
 const summary = {
 	matched: matches.length,
+	excluded: excludedMatches,
 	diffs: diffs.length,
 	patches: diffs.filter(d => d.severity === 'patch').length,
 	skipped: diffs.filter(d => d.severity === 'skip').length,
 	refused: diffs.filter(d => d.severity === 'refuse').length,
 	figmaOnly: unmatchedFigma.length,
 	sceneOnly: unmatchedScene.size,
-	flags: flags.length
+	flags: flags.length,
+	fuzzyMatches: matches.filter(m => m.confidence && m.confidence !== 'high').length
 };
 
 const reportObj = {

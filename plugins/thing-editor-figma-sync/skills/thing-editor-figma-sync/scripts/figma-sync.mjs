@@ -137,13 +137,36 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 		console.error('-> running diff');
 		const patchesPath = `/tmp/patches-${sceneName}.json`;
 		const diffReportPath = `/tmp/diff-report-${sceneName}.json`;
-		const diff = runNode('diff-snapshot.mjs', [
+		const diffArgs = [
 			'--figma', figmaWalkedPath,
 			'--scene', scenePath,
 			'--project', projectAbs,
 			'--patch-out', patchesPath,
 			'--report-json', diffReportPath
-		]);
+		];
+		// Per-scene exclusion rules (Phase A) — user-authored in figma.sync.json.
+		// excludeClasses → comma-joined for the diff-snapshot CLI shape.
+		// excludePatterns → joined into a single (a|b|c) regex for the single
+		// --exclude-pattern arg the existing CLI accepts.
+		// excludeScenePathPrefixes → JSON-stringified array-of-arrays.
+		if (Array.isArray(sceneCfg.excludeClasses) && sceneCfg.excludeClasses.length > 0) {
+			diffArgs.push('--exclude-class', sceneCfg.excludeClasses.join(','));
+		}
+		if (Array.isArray(sceneCfg.excludePatterns) && sceneCfg.excludePatterns.length > 0) {
+			const combined = sceneCfg.excludePatterns
+				.map(p => {
+					// Allow either "/regex/flags" form or literal substring.
+					const m = /^\/(.+)\/[a-z]*$/.exec(p);
+					return m ? m[1] : p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+				})
+				.map(p => `(?:${p})`)
+				.join('|');
+			diffArgs.push('--exclude-pattern', combined);
+		}
+		if (Array.isArray(sceneCfg.excludeScenePathPrefixes) && sceneCfg.excludeScenePathPrefixes.length > 0) {
+			diffArgs.push('--exclude-scene-paths', JSON.stringify(sceneCfg.excludeScenePathPrefixes));
+		}
+		const diff = runNode('diff-snapshot.mjs', diffArgs);
 		if (diff.code !== 0 && diff.code !== 1) throw new Error(`diff-snapshot failed: ${diff.stderr}`);
 		const diffReport = JSON.parse(readFileSync(diffReportPath, 'utf8'));
 		sceneReport.steps.push({ step: 'diff', ok: true, matched: diffReport.summary.matched, patches: diffReport.summary.patches });
