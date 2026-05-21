@@ -26,11 +26,35 @@ import { loadRegistry } from './shared/project-class-registry.mjs';
 const TEXT_CLASS_RE = /(^|[^A-Za-z])(Text|BitmapText|HTMLText)([^A-Za-z]|$)/;
 const FALLBACK_LAYOUT_PARENTS = new Set(['LayoutGroup', 'LayoutGrid', 'Resizer']);
 
+// Phase B — known dynamic engine classes. Subtree gets isDynamic=true if class
+// itself or any class in chain matches.
+const DYNAMIC_ENGINE_CLASSES = new Set([
+	'Trigger',
+	'MovieClip',
+	'Spawner',
+	'ParticleContainer',
+	'Spine',
+	'AnimatedSprite'
+]);
+// Class-name naming-convention regex — classes whose names end with these
+// suffixes are heuristically treated as runtime-controlled. Loose, but the
+// pre-apply gate provides a backstop, and projects can opt out with
+// "autoExcludeDynamic": false in figma.sync.json.
+const DYNAMIC_NAME_SUFFIX_RE = /(Controller|Manager|Animator|Spawner|Mover)$/;
+
 const args = process.argv.slice(2);
+function flagValue(name) {
+	const i = args.indexOf(name);
+	return i >= 0 ? args[i + 1] : null;
+}
 const byName = args.includes('--by-name');
 const projectIdx = args.indexOf('--project');
 const projectRoot = projectIdx >= 0 ? args[projectIdx + 1] : null;
-const file = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--project');
+const extraDynamicClassesStr = flagValue('--dynamic-classes');
+const extraDynamicClasses = extraDynamicClassesStr
+	? new Set(extraDynamicClassesStr.split(',').map(s => s.trim()).filter(Boolean))
+	: null;
+const file = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--project' && args[i - 1] !== '--dynamic-classes');
 if (!file) {
 	console.error('usage: scene-walker.mjs <scene.json> [--by-name] [--project <root>]');
 	process.exit(1);
@@ -103,6 +127,24 @@ function subtreeHasText(node) {
 	return false;
 }
 
+function deriveIsDynamic(cls, chain, prefabRef, parentIsLayoutManaged, parentIsDynamic) {
+	if (parentIsDynamic) return { isDynamic: true, reason: 'ancestor' };
+	if (prefabRef) return { isDynamic: true, reason: `prefabRef:${prefabRef}` };
+	if (parentIsLayoutManaged) return { isDynamic: true, reason: 'parent-layout-managed' };
+	if (!cls) return { isDynamic: false, reason: null };
+	if (DYNAMIC_ENGINE_CLASSES.has(cls)) return { isDynamic: true, reason: `class:${cls}` };
+	if (extraDynamicClasses && extraDynamicClasses.has(cls)) return { isDynamic: true, reason: `project-class:${cls}` };
+	if (DYNAMIC_NAME_SUFFIX_RE.test(cls)) return { isDynamic: true, reason: `name-suffix:${cls}` };
+	if (Array.isArray(chain)) {
+		for (const c of chain) {
+			if (DYNAMIC_ENGINE_CLASSES.has(c)) return { isDynamic: true, reason: `chain:${c}` };
+			if (extraDynamicClasses && extraDynamicClasses.has(c)) return { isDynamic: true, reason: `project-chain:${c}` };
+			if (DYNAMIC_NAME_SUFFIX_RE.test(c)) return { isDynamic: true, reason: `chain-name-suffix:${c}` };
+		}
+	}
+	return { isDynamic: false, reason: null };
+}
+
 function deriveResizeFlags(node, parent) {
 	const p = node.p ?? {};
 	const pp = parent?.p ?? {};
@@ -125,7 +167,7 @@ function deriveResizeFlags(node, parent) {
 	};
 }
 
-function walk(node, path, parentNamePath, parentName, childIndex, parent) {
+function walk(node, path, parentNamePath, parentName, childIndex, parent, parentIsDynamic) {
 	const props = node.p ?? {};
 	const name = props.name ?? null;
 	const cls = node.c ?? null;
@@ -135,6 +177,8 @@ function walk(node, path, parentNamePath, parentName, childIndex, parent) {
 
 	const segment = name ?? `<unnamed#${childIndex ?? 0}>`;
 	const namePath = parentNamePath ? `${parentNamePath}/${segment}` : segment;
+	const resize = deriveResizeFlags(node, parent);
+	const dyn = deriveIsDynamic(cls, info.chain, prefabRef, resize.parentIsLayoutManaged, !!parentIsDynamic);
 
 	const entry = {
 		name,
@@ -149,7 +193,9 @@ function walk(node, path, parentNamePath, parentName, childIndex, parent) {
 		props,
 		isText: info.isText,
 		hasTextDescendant,
-		_resize: deriveResizeFlags(node, parent)
+		isDynamic: dyn.isDynamic,
+		dynamicReason: dyn.reason,
+		_resize: resize
 	};
 
 	if (engineSnapshotByScenePath) {
@@ -171,7 +217,7 @@ function walk(node, path, parentNamePath, parentName, childIndex, parent) {
 
 	const children = node[':'] ?? [];
 	children.forEach((child, i) => {
-		walk(child, [...path, ':', i], namePath, name ?? parentName, i, node);
+		walk(child, [...path, ':', i], namePath, name ?? parentName, i, node, entry.isDynamic);
 	});
 }
 
@@ -179,5 +225,5 @@ function pathStr(p) {
 	return p.length === 0 ? '<root>' : p.join('.');
 }
 
-walk(root, [], null, null, null, null);
+walk(root, [], null, null, null, null, false);
 process.stdout.write(JSON.stringify(out, null, 2));

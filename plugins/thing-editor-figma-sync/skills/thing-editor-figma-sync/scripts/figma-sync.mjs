@@ -82,6 +82,16 @@ const report = {
 	summary: { total: 0, pass: 0, drift: 0, error: 0 }
 };
 
+// scene-walker args builder — forwards per-project dynamic-class names so the
+// walker's isDynamic heuristic picks up project-specific patterns.
+function sceneWalkerArgs(scenePath, projectAbs, sceneCfg) {
+	const args = [scenePath, '--project', projectAbs];
+	if (Array.isArray(sceneCfg?.dynamicClassPatterns) && sceneCfg.dynamicClassPatterns.length > 0) {
+		args.push('--dynamic-classes', sceneCfg.dynamicClassPatterns.join(','));
+	}
+	return args;
+}
+
 function runNode(scriptRelPath, scriptArgs, opts = {}) {
 	const scriptPath = join(__dirname, scriptRelPath);
 	const res = spawnSync('node', [scriptPath, ...scriptArgs], {
@@ -129,7 +139,7 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 
 		const scenePath = join(projectAbs, 'assets', sceneName + '.s.json');
 		const sceneFlatPath = `/tmp/scene-flat-${sceneName}.json`;
-		const walkScene = runNode('scene-walker.mjs', [scenePath, '--project', projectAbs], { stdio: ['ignore', 'pipe', 'pipe'] });
+		const walkScene = runNode('scene-walker.mjs', sceneWalkerArgs(scenePath, projectAbs, sceneCfg), { stdio: ['ignore', 'pipe', 'pipe'] });
 		if (walkScene.code !== 0) throw new Error(`scene-walker failed: ${walkScene.stderr}`);
 		writeFileSync(sceneFlatPath, walkScene.stdout);
 
@@ -166,6 +176,13 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 		if (Array.isArray(sceneCfg.excludeScenePathPrefixes) && sceneCfg.excludeScenePathPrefixes.length > 0) {
 			diffArgs.push('--exclude-scene-paths', JSON.stringify(sceneCfg.excludeScenePathPrefixes));
 		}
+		// Phase B — auto-exclude dynamic subtrees (default ON unless explicitly
+		// disabled). scene-walker derives isDynamic per node from class chain +
+		// prefabRef + parent-layout-managed + name suffix heuristics.
+		const autoExcludeDynamicEff = sceneCfg.autoExcludeDynamic !== false;
+		if (autoExcludeDynamicEff) {
+			diffArgs.push('--auto-exclude-dynamic');
+		}
 		const diff = runNode('diff-snapshot.mjs', diffArgs);
 		if (diff.code !== 0 && diff.code !== 1) throw new Error(`diff-snapshot failed: ${diff.stderr}`);
 		const diffReport = JSON.parse(readFileSync(diffReportPath, 'utf8'));
@@ -194,7 +211,7 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 				await exportSceneViaCommand(projectAbs, sceneName, { forceDiscard: true });
 
 				// Re-walk for accurate region list.
-				const reWalk = runNode('scene-walker.mjs', [scenePath, '--project', projectAbs], { stdio: ['ignore', 'pipe', 'pipe'] });
+				const reWalk = runNode('scene-walker.mjs', sceneWalkerArgs(scenePath, projectAbs, sceneCfg), { stdio: ['ignore', 'pipe', 'pipe'] });
 				writeFileSync(sceneFlatPath, reWalk.stdout);
 			}
 			sceneReport.steps.push({ step: 'apply', applied: appliedCount });

@@ -62,6 +62,7 @@ const ssimThreshold = Number(flagValue('--ssim-threshold')) || 0.95;
 const excludeClassesStr = flagValue('--exclude-class');
 const excludePatternStr = flagValue('--exclude-pattern');
 const excludeScenePathsStr = flagValue('--exclude-scene-paths');
+const autoExcludeDynamic = flagPresent('--auto-exclude-dynamic');
 const excludeClasses = excludeClassesStr ? new Set(excludeClassesStr.split(',').map(s => s.trim()).filter(Boolean)) : null;
 const excludePattern = excludePatternStr ? new RegExp(excludePatternStr) : null;
 let excludeScenePaths = null;
@@ -75,6 +76,9 @@ if (excludeScenePathsStr) {
 }
 
 function isExcludedSceneNode(sceneEntry) {
+	if (autoExcludeDynamic && sceneEntry.isDynamic) {
+		return { excluded: true, reason: `auto-dynamic:${sceneEntry.dynamicReason ?? 'unknown'}` };
+	}
 	if (excludeClasses) {
 		if (excludeClasses.has(sceneEntry.class)) return { excluded: true, reason: `class:${sceneEntry.class}` };
 		const chain = Array.isArray(sceneEntry.chain) ? sceneEntry.chain : [];
