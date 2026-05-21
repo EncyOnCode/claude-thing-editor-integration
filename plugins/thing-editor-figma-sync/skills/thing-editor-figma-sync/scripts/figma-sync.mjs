@@ -37,6 +37,12 @@ const threshold = Number(flagValue('--threshold') ?? '0.95');
 const regionThreshold = Number(flagValue('--ssim-region-threshold') ?? '0.85');
 const outReport = flagValue('--out-report');
 const autoConfidence = flagValue('--auto-confidence') ?? 'high'; // high | medium | low
+// AI-gate inputs: regions matching --exclude-pattern get masked from SSIM.
+// Typical use: "/(balance|score|name|avatar|userName|playerName|coin)/" to
+// suppress dynamic-data drift on text/sprite leaves the engine fills at
+// runtime. --exclude-class adds class-name filtering.
+const excludePattern = flagValue('--exclude-pattern');
+const excludeClass = flagValue('--exclude-class');
 
 if (!projectRoot) {
 	console.error('usage: figma-sync.mjs --project <path> [--scene <name>] [--apply] [--threshold 0.95]');
@@ -176,14 +182,17 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 		const enginePng = join(projectAbs, '.thing-editor-meta', 'screenshots', sceneName + '.png');
 		const diffPng = `/tmp/diff-${sceneName}.png`;
 		const ssimThreshold = sceneCfg.ssimThreshold ?? threshold;
-		const ssim = runNode('compare-screenshots.mjs', [
+		const ssimArgs = [
 			'--engine', enginePng,
 			'--figma', figmaPngPath,
 			'--scene-flat', sceneFlatPath,
 			'--output-diff', diffPng,
 			'--threshold', String(ssimThreshold),
 			'--region-threshold', String(regionThreshold)
-		]);
+		];
+		if (excludePattern) ssimArgs.push('--exclude-pattern', excludePattern);
+		if (excludeClass) ssimArgs.push('--exclude-class', excludeClass);
+		const ssim = runNode('compare-screenshots.mjs', ssimArgs);
 		const ssimReport = ssim.stdout ? JSON.parse(ssim.stdout) : null;
 
 		sceneReport.steps.push({ step: 'ssim', overall: ssimReport?.overallSsim, threshold: ssimThreshold, pass: ssim.code === 0 });
@@ -192,6 +201,22 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 		sceneReport.patches = diffReport.summary.patches;
 		sceneReport.applied = appliedCount;
 		sceneReport.status = ssim.code === 0 ? 'pass' : 'drift';
+		// Persist artifact paths so an external AI/LLM gate can read them on
+		// the next pass: diff report (per-node deltas + match confidences),
+		// SSIM report (per-region scores + excluded markers), screenshots,
+		// scene-flat snapshot.
+		sceneReport.artifacts = {
+			diffReport: diffReportPath,
+			ssimReport: ssimReport ? `/tmp/ssim-report-${sceneName}.json` : null,
+			sceneFlat: sceneFlatPath,
+			figmaWalked: figmaWalkedPath,
+			enginePng,
+			figmaPng: figmaPngPath,
+			diffPng
+		};
+		if (ssimReport) {
+			writeFileSync(sceneReport.artifacts.ssimReport, JSON.stringify(ssimReport, null, 2));
+		}
 	} catch (e) {
 		sceneReport.status = 'error';
 		sceneReport.error = e?.message || String(e);
