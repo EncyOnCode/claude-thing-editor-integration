@@ -44,9 +44,20 @@ const outputDiff = flagValue('--output-diff');
 const sceneFlatPath = flagValue('--scene-flat');
 const threshold = Number(flagValue('--threshold') ?? '0.95');
 const regionThreshold = Number(flagValue('--region-threshold') ?? '0.85');
+// Exclude regions from the SSIM compare. Two complementary modes:
+//   --exclude-pattern <regex>  — JS regex tested against entry.namePath
+//   --exclude-class <classes>  — comma list of class names (Trigger, MovieClip, etc.)
+// When a region is excluded its bbox gets masked (filled black) in BOTH the
+// engine and figma images before whole-image SSIM, so dynamic-state drift
+// doesn't pollute the overall score. The per-region report marks
+// excluded:true with the matched filter.
+const excludePatternStr = flagValue('--exclude-pattern');
+const excludeClassesStr = flagValue('--exclude-class');
+const excludePattern = excludePatternStr ? new RegExp(excludePatternStr) : null;
+const excludeClasses = excludeClassesStr ? new Set(excludeClassesStr.split(',').map(s => s.trim()).filter(Boolean)) : null;
 
 if (!enginePath || !figmaPath) {
-	console.error('usage: compare-screenshots.mjs --engine <png> --figma <png> [--output-diff <png>] [--scene-flat <json>] [--threshold 0.95] [--region-threshold 0.85]');
+	console.error('usage: compare-screenshots.mjs --engine <png> --figma <png> [--output-diff <png>] [--scene-flat <json>] [--threshold 0.95] [--region-threshold 0.85] [--exclude-pattern <regex>] [--exclude-class <a,b>]');
 	process.exit(2);
 }
 for (const p of [enginePath, figmaPath]) {
@@ -80,6 +91,53 @@ if (engineImg.width !== figmaImg.width || engineImg.height !== figmaImg.height) 
 	console.error(`error: ${warnings[0]}`);
 	console.error('hint: regenerate figma export at the same scale as engine gameSize, or crop/rescale before comparing.');
 	process.exit(2);
+}
+
+// Pre-compute list of excluded regions BEFORE the whole-image SSIM so we can
+// black out their pixel zones first. Requires sceneFlat.
+const wImg = engineImg.width;
+const hImg = engineImg.height;
+const excludedRegions = [];
+if (sceneFlatPath && (excludePattern || excludeClasses)) {
+	if (existsSync(resolve(sceneFlatPath))) {
+		const sceneFlat = JSON.parse(readFileSync(resolve(sceneFlatPath), 'utf8'));
+		for (const [namePath, entry] of Object.entries(sceneFlat)) {
+			if (!entry.world?.bounds) continue;
+			let matchReason = null;
+			if (excludePattern && excludePattern.test(namePath)) matchReason = `pattern: /${excludePattern.source}/`;
+			else if (excludeClasses && excludeClasses.has(entry.class)) matchReason = `class: ${entry.class}`;
+			if (!matchReason) continue;
+			const b = entry.world.bounds;
+			const x = Math.max(0, Math.floor(b.x));
+			const y = Math.max(0, Math.floor(b.y));
+			const rw = Math.min(wImg - x, Math.ceil(b.width));
+			const rh = Math.min(hImg - y, Math.ceil(b.height));
+			if (rw <= 0 || rh <= 0) continue;
+			excludedRegions.push({ namePath, class: entry.class, reason: matchReason, x, y, w: rw, h: rh });
+		}
+	} else {
+		console.error(`warn: --scene-flat ${sceneFlatPath} missing; exclude flags ignored`);
+	}
+}
+
+function fillBlack(img, x, y, w, h) {
+	for (let row = 0; row < h; row++) {
+		const start = ((y + row) * img.width + x) * 4;
+		for (let i = 0; i < w * 4; i += 4) {
+			img.data[start + i] = 0;
+			img.data[start + i + 1] = 0;
+			img.data[start + i + 2] = 0;
+			img.data[start + i + 3] = 255;
+		}
+	}
+}
+
+for (const r of excludedRegions) {
+	fillBlack(engineImg, r.x, r.y, r.w, r.h);
+	fillBlack(figmaImg, r.x, r.y, r.w, r.h);
+}
+if (excludedRegions.length > 0) {
+	console.error(`info: masked ${excludedRegions.length} excluded regions before whole-image SSIM`);
 }
 
 const { mssim } = ssim(ssimImageData(engineImg), ssimImageData(figmaImg));
@@ -127,6 +185,7 @@ if (sceneFlatPath) {
 			e.class !== 'LayoutGrid'
 		);
 
+		const excludedKey = new Map(excludedRegions.map(r => [r.namePath, r.reason]));
 		for (const [namePath, entry] of entries) {
 			const bbox = entry.world.bounds;
 			const x = Math.max(0, Math.floor(bbox.x));
@@ -134,6 +193,15 @@ if (sceneFlatPath) {
 			const rw = Math.min(w - x, Math.ceil(bbox.width));
 			const rh = Math.min(h - y, Math.ceil(bbox.height));
 			if (rw < 4 || rh < 4) continue; // ssim.js requires min 4×4
+			if (excludedKey.has(namePath)) {
+				regions.push({
+					namePath, class: entry.class,
+					bbox: { x, y, w: rw, h: rh },
+					ssim: null, mismatchPercent: 0, pass: true,
+					excluded: true, excludeReason: excludedKey.get(namePath)
+				});
+				continue;
+			}
 
 			const engineCrop = cropRGBA(engineImg, x, y, rw, rh);
 			const figmaCrop = cropRGBA(figmaImg, x, y, rw, rh);
@@ -179,6 +247,7 @@ if (sceneFlatPath) {
 
 const totalPixels = w * h;
 const degenerateCount = regions.filter(r => r.degenerate).length;
+const excludedCount = regions.filter(r => r.excluded).length;
 const report = {
 	overallSsim: Number(overallSsim.toFixed(4)),
 	threshold,
@@ -191,18 +260,20 @@ const report = {
 	regionThreshold,
 	regions,
 	regionsDegenerate: degenerateCount,
+	regionsExcluded: excludedCount,
 	warnings
 };
 
 console.error(`SSIM: ${report.overallSsim} (threshold ${threshold}, ${report.pass ? 'PASS' : 'FAIL'})`);
 console.error(`pixel mismatch: ${mismatchedPixels} / ${totalPixels} (${report.mismatchPercent}%)`);
+if (excludedCount > 0) console.error(`excluded regions: ${excludedCount} masked before SSIM`);
 if (diffPath) console.error(`diff overlay: ${diffPath}`);
 if (regions.length) {
-	// Filter out degenerate regions from the top-failures listing. They're
-	// uniform crops (alpha-transparent / blank) where SSIM math is unreliable
-	// and they swamp the actual problem regions when sorted by ssim asc.
-	const failed = regions.filter(r => !r.pass && !r.degenerate);
-	console.error(`regions: ${regions.length} scored, ${failed.length} below threshold ${regionThreshold}${degenerateCount ? ` (${degenerateCount} degenerate ssim=0 cells suppressed)` : ''}`);
+	const failed = regions.filter(r => !r.pass && !r.degenerate && !r.excluded);
+	const extras = [];
+	if (degenerateCount) extras.push(`${degenerateCount} degenerate ssim=0 cells suppressed`);
+	if (excludedCount) extras.push(`${excludedCount} excluded`);
+	console.error(`regions: ${regions.length} scored, ${failed.length} below threshold ${regionThreshold}${extras.length ? ` (${extras.join(', ')})` : ''}`);
 	for (const r of failed.slice(0, 10)) {
 		console.error(`  FAIL ${r.namePath} (${r.class}) ssim=${r.ssim} mismatch=${r.mismatchPercent}%`);
 	}
