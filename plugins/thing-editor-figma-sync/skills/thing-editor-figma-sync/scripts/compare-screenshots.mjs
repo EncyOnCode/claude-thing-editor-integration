@@ -151,13 +151,26 @@ if (sceneFlatPath) {
 				const db = Math.abs(engineCrop.data[off + 2] - figmaCrop.data[off + 2]);
 				if (dr + dg + db > 8) regionMismatch++;
 			}
+			// SSIM degenerates to 0 when both crops have zero variance (uniform
+			// regions: alpha-transparent zones, blank backgrounds). The two
+			// crops are visually identical — zero mismatched pixels — yet SSIM
+			// reports total failure because its luma/contrast normalization
+			// divides by ~0. Treat such cells as a pass (ssim=1) and flag them
+			// for the JSON report so users can audit. Filtered out of the
+			// stderr "top failures" listing to keep signal high.
+			let degenerate = false;
+			if (regionSsim != null && regionMismatch === 0 && regionSsim < 0.5) {
+				degenerate = true;
+				regionSsim = 1.0;
+			}
 			regions.push({
 				namePath,
 				class: entry.class,
 				bbox: { x, y, w: rw, h: rh },
 				ssim: regionSsim != null ? Number(regionSsim.toFixed(4)) : null,
 				mismatchPercent: Number((regionMismatch / (rw * rh) * 100).toFixed(2)),
-				pass: regionSsim != null ? regionSsim >= regionThreshold : false
+				pass: regionSsim != null ? regionSsim >= regionThreshold : false,
+				degenerate
 			});
 		}
 		regions.sort((a, b) => (a.ssim ?? 0) - (b.ssim ?? 0));
@@ -165,6 +178,7 @@ if (sceneFlatPath) {
 }
 
 const totalPixels = w * h;
+const degenerateCount = regions.filter(r => r.degenerate).length;
 const report = {
 	overallSsim: Number(overallSsim.toFixed(4)),
 	threshold,
@@ -176,6 +190,7 @@ const report = {
 	diffPath,
 	regionThreshold,
 	regions,
+	regionsDegenerate: degenerateCount,
 	warnings
 };
 
@@ -183,8 +198,11 @@ console.error(`SSIM: ${report.overallSsim} (threshold ${threshold}, ${report.pas
 console.error(`pixel mismatch: ${mismatchedPixels} / ${totalPixels} (${report.mismatchPercent}%)`);
 if (diffPath) console.error(`diff overlay: ${diffPath}`);
 if (regions.length) {
-	const failed = regions.filter(r => !r.pass);
-	console.error(`regions: ${regions.length} scored, ${failed.length} below threshold ${regionThreshold}`);
+	// Filter out degenerate regions from the top-failures listing. They're
+	// uniform crops (alpha-transparent / blank) where SSIM math is unreliable
+	// and they swamp the actual problem regions when sorted by ssim asc.
+	const failed = regions.filter(r => !r.pass && !r.degenerate);
+	console.error(`regions: ${regions.length} scored, ${failed.length} below threshold ${regionThreshold}${degenerateCount ? ` (${degenerateCount} degenerate ssim=0 cells suppressed)` : ''}`);
 	for (const r of failed.slice(0, 10)) {
 		console.error(`  FAIL ${r.namePath} (${r.class}) ssim=${r.ssim} mismatch=${r.mismatchPercent}%`);
 	}
