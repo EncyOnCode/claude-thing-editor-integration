@@ -38,8 +38,9 @@ const revertScene = flagValue('--revert');
 const revertAll = flagPresent('--revert-all');
 const yes = flagPresent('--yes');
 // Phase D defaults — gate thresholds. Per-scene override via figma.sync.json:
-// `gateRatioDynamic` (number 0..1) and `gatePatchesProposed` (number).
+// `gateRatioDynamic` / `gateRatioFuzzy` (numbers 0..1) and `gatePatchesProposed`.
 const GATE_RATIO_DYNAMIC_DEFAULT = 0.5;
+const GATE_RATIO_FUZZY_DEFAULT = 0.5;
 const GATE_PATCHES_PROPOSED_DEFAULT = 100;
 const threshold = Number(flagValue('--threshold') ?? '0.95');
 const regionThreshold = Number(flagValue('--ssim-region-threshold') ?? '0.85');
@@ -284,21 +285,30 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 		// review prompt with the patch file path.
 		const totalConsidered = (diffReport.summary.matched ?? 0) + (diffReport.summary.excluded ?? 0);
 		const ratioDynamic = totalConsidered > 0 ? (diffReport.summary.excluded ?? 0) / totalConsidered : 0;
+		const matched = diffReport.summary.matched ?? 0;
+		const fuzzyMatches = diffReport.summary.fuzzyMatches ?? 0;
+		const ratioFuzzy = matched > 0 ? fuzzyMatches / matched : 0;
 		const driftProfile = {
-			totalMatches: diffReport.summary.matched ?? 0,
+			totalMatches: matched,
 			excludedMatches: diffReport.summary.excluded ?? 0,
 			patchesProposed: diffReport.summary.patches ?? 0,
-			fuzzyMatches: diffReport.summary.fuzzyMatches ?? 0,
-			ratioDynamic: Number(ratioDynamic.toFixed(3))
+			fuzzyMatches,
+			ratioDynamic: Number(ratioDynamic.toFixed(3)),
+			ratioFuzzy: Number(ratioFuzzy.toFixed(3))
 		};
 		sceneReport.driftProfile = driftProfile;
 		const gateRatio = sceneCfg.gateRatioDynamic ?? GATE_RATIO_DYNAMIC_DEFAULT;
+		const gateRatioFuzzy = sceneCfg.gateRatioFuzzy ?? GATE_RATIO_FUZZY_DEFAULT;
 		const gatePatches = sceneCfg.gatePatchesProposed ?? GATE_PATCHES_PROPOSED_DEFAULT;
 		const gateTriggered = (driftProfile.ratioDynamic > gateRatio) ||
+			(driftProfile.ratioFuzzy > gateRatioFuzzy) ||
 			(driftProfile.patchesProposed > gatePatches);
 		const gateReasons = [];
 		if (driftProfile.ratioDynamic > gateRatio) {
 			gateReasons.push(`ratioDynamic=${driftProfile.ratioDynamic} > ${gateRatio}`);
+		}
+		if (driftProfile.ratioFuzzy > gateRatioFuzzy) {
+			gateReasons.push(`ratioFuzzy=${driftProfile.ratioFuzzy} > ${gateRatioFuzzy} (${fuzzyMatches}/${matched} matches low-confidence)`);
 		}
 		if (driftProfile.patchesProposed > gatePatches) {
 			gateReasons.push(`patchesProposed=${driftProfile.patchesProposed} > ${gatePatches}`);

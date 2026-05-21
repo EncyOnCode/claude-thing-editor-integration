@@ -483,6 +483,7 @@ const reportObj = {
 		scenePath: m.scene?.path,
 		figmaId: m.figma.id,
 		matchedBy: m.matchedBy,
+		confidence: m.confidence,
 		namePath: m.namePath
 	})),
 	diffs,
