@@ -76,12 +76,48 @@ const registryIsEngineTruth = !!(
 const UNSAFE_TYPES = new Set(['ref', 'data-path', 'callback', 'prefab']);
 const NON_DATA_TYPES = new Set(['btn', 'splitter']);
 
+// Runtime PIXI properties — present on every DisplayObject/Container regardless
+// of whether the class declares them with `@editable`. Patching them is always
+// safe at the type level (engine still respects refuse-matrix elsewhere). We
+// fall back to JS typeof checks instead of __editableProps for these.
+const RUNTIME_PIXI_PROPS = {
+	x: 'number',
+	y: 'number',
+	alpha: 'number',
+	rotation: 'number',
+	tint: 'color',
+	visible: 'boolean',
+	'scale.x': 'number',
+	'scale.y': 'number',
+	'pivot.x': 'number',
+	'pivot.y': 'number',
+	'skew.x': 'number',
+	'skew.y': 'number',
+	width: 'number',
+	height: 'number',
+	// Resizer/canOverride alternatives — written by Phase 2A diff path. They're
+	// engine-side @editable on Container, but custom classes that don't extend
+	// Container directly may not surface them. Whitelist as numbers.
+	normalizePosX: 'number',
+	normalizePosY: 'number',
+	normAnchorX: 'number',
+	normAnchorY: 'number',
+	normPivotX: 'number',
+	normPivotY: 'number'
+};
+
 function validatePropType(classInfo, prop, value) {
 	if (!classInfo || !Array.isArray(classInfo.__editableProps) || classInfo.__editableProps.length === 0) {
 		return { ok: true, skip: true };
 	}
 	const propDef = classInfo.__editableProps.find(p => p.name === prop);
 	if (!propDef) {
+		// Runtime PIXI prop fallback — class doesn't list it in __editableProps
+		// but it's valid on every DisplayObject.
+		const fallbackType = RUNTIME_PIXI_PROPS[prop];
+		if (fallbackType) {
+			return validateTypedValue(fallbackType, prop, value, null, null);
+		}
 		return { ok: false, code: 'UNKNOWN_PROP', reason: `class "${classInfo.chain?.[0] || '?'}" has no editable prop "${prop}"` };
 	}
 	const t = propDef.type;
@@ -91,17 +127,21 @@ function validatePropType(classInfo, prop, value) {
 	if (NON_DATA_TYPES.has(t)) {
 		return { ok: false, code: 'NON_DATA', reason: `prop "${prop}" is type "${t}" (UI-only, not serializable)` };
 	}
+	return validateTypedValue(t, prop, value, propDef.min, propDef.max);
+}
+
+function validateTypedValue(t, prop, value, min, max) {
 	switch (t) {
 		case 'number':
 		case 'slider': {
 			if (typeof value !== 'number' || !Number.isFinite(value)) {
 				return { ok: false, code: 'TYPE_MISMATCH', reason: `prop "${prop}" expects number, got ${typeof value} (${JSON.stringify(value)})` };
 			}
-			if (typeof propDef.min === 'number' && value < propDef.min) {
-				return { ok: false, code: 'OUT_OF_RANGE', reason: `prop "${prop}" value ${value} < min ${propDef.min}` };
+			if (typeof min === 'number' && value < min) {
+				return { ok: false, code: 'OUT_OF_RANGE', reason: `prop "${prop}" value ${value} < min ${min}` };
 			}
-			if (typeof propDef.max === 'number' && value > propDef.max) {
-				return { ok: false, code: 'OUT_OF_RANGE', reason: `prop "${prop}" value ${value} > max ${propDef.max}` };
+			if (typeof max === 'number' && value > max) {
+				return { ok: false, code: 'OUT_OF_RANGE', reason: `prop "${prop}" value ${value} > max ${max}` };
 			}
 			return { ok: true };
 		}
