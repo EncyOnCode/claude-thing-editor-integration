@@ -48,6 +48,9 @@ const connectPath = flagValue('--connect');
 const reportJsonPath = flagValue('--report-json');
 const patchOutPath = flagValue('--patch-out');
 const screenshotPath = flagValue('--screenshot');
+const verifyScreenshot = flagPresent('--verify-screenshot');
+const figmaImagePath = flagValue('--figma-image');
+const ssimThreshold = Number(flagValue('--ssim-threshold')) || 0.95;
 const projectRoot = flagValue('--project');
 const tokensPath = flagValue('--tokens');
 const autoApply = flagPresent('--auto-apply');
@@ -93,13 +96,63 @@ if (projectRoot) {
 	}
 }
 
-// Workflow D acknowledgement
+// Workflow D acknowledgement (legacy --screenshot only emits a flag downstream).
+// Real visual diff fires later in the report flow via --verify-screenshot.
 if (screenshotPath) {
 	if (!existsSync(resolve(screenshotPath))) {
 		console.error(`error: --screenshot file not found: ${screenshotPath}`);
 		process.exit(2);
 	}
-	console.error(`Visual diff is a future-work feature. Screenshot hook acknowledged. Skipping pixel comparison.`);
+}
+
+// Resolve the engine PNG: explicit --screenshot wins; otherwise auto-resolve
+// from <projectRoot>/.thing-editor-meta/screenshots/<sceneName>.png keyed by
+// the scene snapshot's `scene` field (falls back to scene file basename).
+function resolveEngineScreenshotPath(explicit, projectRootOpt, sceneFilePath) {
+	if (explicit) return resolve(explicit);
+	if (!projectRootOpt) return null;
+	// Try snapshot's `scene` name first.
+	let sceneName = null;
+	try {
+		const snap = JSON.parse(readFileSync(resolve(sceneFilePath), 'utf8'));
+		sceneName = snap.scene || null;
+	} catch { /* ignore */ }
+	if (!sceneName) {
+		sceneName = basename(sceneFilePath).replace(/\.s\.json$/, '').replace(/\.json$/, '');
+	}
+	return resolve(join(projectRootOpt, '.thing-editor-meta', 'screenshots', sceneName + '.png'));
+}
+
+// Spawn compare-screenshots.mjs and parse its JSON stdout.
+// Never fails the parent diff — returns { error } on any spawn issue.
+function runCompareScreenshots(enginePng, figmaPng, threshold) {
+	const script = resolve(__dirname, 'compare-screenshots.mjs');
+	const cmd = process.execPath;
+	const argv = [script, '--engine', enginePng, '--figma', figmaPng, '--threshold', String(threshold)];
+	let res;
+	try {
+		res = spawnSync(cmd, argv, { encoding: 'utf8', timeout: 30000, maxBuffer: 32 * 1024 * 1024 });
+	} catch (e) {
+		return { error: e.message };
+	}
+	if (res.error) return { error: res.error.message };
+	if (res.status === null) return { error: `compare-screenshots timed out or was killed (signal ${res.signal || '?'})` };
+	let parsed;
+	try {
+		parsed = JSON.parse(res.stdout || '{}');
+	} catch (e) {
+		const tail = (res.stderr || '').split('\n').slice(-5).join('\n');
+		return { error: `compare-screenshots stdout was not JSON: ${e.message}; last stderr: ${tail}` };
+	}
+	return {
+		ssim: typeof parsed.overallSsim === 'number' ? parsed.overallSsim : 0,
+		passed: !!parsed.pass,
+		regions: Array.isArray(parsed.regions)
+			? parsed.regions.filter(r => !r.pass && !r.degenerate && !r.excluded).map(r => ({
+				namePath: r.namePath, class: r.class, ssim: r.ssim, mismatchPercent: r.mismatchPercent
+			}))
+			: []
+	};
 }
 
 // Load inputs
@@ -374,13 +427,63 @@ const reportObj = {
 	summary
 };
 
-// Workflow D entry in flags
-if (screenshotPath) {
+// Workflow D — visual diff via spawned compare-screenshots.mjs.
+// --verify-screenshot triggers the real spawn; legacy --screenshot alone still
+// emits the acknowledgement flag for backward compat.
+if (verifyScreenshot) {
+	const enginePng = resolveEngineScreenshotPath(screenshotPath, projectRoot, scenePath);
+	const figmaPng = figmaImagePath;
+	if (!enginePng || !existsSync(enginePng)) {
+		flags.push({
+			scenePath: [],
+			code: 'VISUAL_DIFF_ERROR',
+			level: 'warn',
+			message: `engine screenshot not found at ${enginePng || '<auto-resolve failed>'} — run "Project → Export Figma-Sync metadata" first`
+		});
+	} else if (!figmaPng || !existsSync(figmaPng)) {
+		flags.push({
+			scenePath: [],
+			code: 'VISUAL_DIFF_SKIPPED',
+			level: 'info',
+			message: `--figma-image not supplied or missing — fetch via fetch-figma-image.mjs`
+		});
+	} else {
+		const result = runCompareScreenshots(enginePng, figmaPng, ssimThreshold);
+		if (result.error) {
+			flags.push({
+				scenePath: [],
+				code: 'VISUAL_DIFF_ERROR',
+				level: 'warn',
+				message: `compare-screenshots failed: ${result.error}`
+			});
+		} else {
+			flags.push({
+				scenePath: [],
+				code: 'VISUAL_DIFF',
+				level: result.passed ? 'info' : 'warn',
+				message: `SSIM ${result.ssim.toFixed(4)} (threshold ${ssimThreshold}), ${result.passed ? 'PASS' : 'FAIL'}`,
+				ssim: result.ssim,
+				threshold: ssimThreshold,
+				passed: result.passed,
+				regions: result.regions || []
+			});
+			if (!result.passed) {
+				flags.push({
+					scenePath: [],
+					code: 'VISUAL_DIFF_REGRESSION',
+					level: 'warn',
+					message: `Visual SSIM ${result.ssim.toFixed(4)} below threshold ${ssimThreshold}. Per-region drift in flag VISUAL_DIFF.`
+				});
+			}
+		}
+	}
+} else if (screenshotPath) {
+	// Legacy --screenshot acknowledgement (back-compat).
 	flags.push({
 		scenePath: [],
 		code: 'VISUAL_DIFF_DEFERRED',
 		level: 'info',
-		message: 'screenshot hook acknowledged; pixel comparison not implemented yet'
+		message: 'screenshot hook acknowledged; pass --verify-screenshot + --figma-image to enable SSIM comparison'
 	});
 }
 
