@@ -48,12 +48,97 @@ if (!scenePath || !patchPath) {
 
 // Optional registry — extends isLayoutManaged() and isTextClass() so refuse
 // rules catch custom LayoutGroup/Resizer/Text subclasses (e.g. AnimatedLayoutGroup
-// extends LayoutGroup extends Shape) that the hardcoded sets miss.
+// extends LayoutGroup extends Shape) that the hardcoded sets miss. Also drives
+// Phase 5 strict prop-type validation when classes carry __editableProps from
+// engine truth.
+let registry = null;
 if (projectRoot) {
 	try {
-		extendTokens(loadRegistry(projectRoot));
+		registry = loadRegistry(projectRoot);
+		extendTokens(registry);
 	} catch (e) {
 		console.error(`warn: failed to load class registry from ${projectRoot}: ${e.message}`);
+	}
+}
+
+// Engine-truth detection — strict type validation only fires when the registry
+// came from `.thing-editor-meta/classes.json`. Regex-only registries lack
+// __editableProps and degrade to TYPE_CHECK_SKIPPED.
+const registryIsEngineTruth = !!(
+	registry &&
+	(registry.version === 'engine-1' ||
+		Object.values(registry.classes || {}).some(c => Array.isArray(c.__editableProps)))
+);
+
+// Strict type-validation rules (Phase 5). Editor-only types reject because the
+// AI must not blindly land refs / data-paths / callbacks / prefab refs into a
+// scene without dedicated tooling. `btn`/`splitter` are non-data render hooks.
+const UNSAFE_TYPES = new Set(['ref', 'data-path', 'callback', 'prefab']);
+const NON_DATA_TYPES = new Set(['btn', 'splitter']);
+
+function validatePropType(classInfo, prop, value) {
+	if (!classInfo || !Array.isArray(classInfo.__editableProps) || classInfo.__editableProps.length === 0) {
+		return { ok: true, skip: true };
+	}
+	const propDef = classInfo.__editableProps.find(p => p.name === prop);
+	if (!propDef) {
+		return { ok: false, code: 'UNKNOWN_PROP', reason: `class "${classInfo.chain?.[0] || '?'}" has no editable prop "${prop}"` };
+	}
+	const t = propDef.type;
+	if (UNSAFE_TYPES.has(t)) {
+		return { ok: false, code: 'UNSAFE_TYPE', reason: `prop "${prop}" is type "${t}" — refusing to land via AI patch` };
+	}
+	if (NON_DATA_TYPES.has(t)) {
+		return { ok: false, code: 'NON_DATA', reason: `prop "${prop}" is type "${t}" (UI-only, not serializable)` };
+	}
+	switch (t) {
+		case 'number':
+		case 'slider': {
+			if (typeof value !== 'number' || !Number.isFinite(value)) {
+				return { ok: false, code: 'TYPE_MISMATCH', reason: `prop "${prop}" expects number, got ${typeof value} (${JSON.stringify(value)})` };
+			}
+			if (typeof propDef.min === 'number' && value < propDef.min) {
+				return { ok: false, code: 'OUT_OF_RANGE', reason: `prop "${prop}" value ${value} < min ${propDef.min}` };
+			}
+			if (typeof propDef.max === 'number' && value > propDef.max) {
+				return { ok: false, code: 'OUT_OF_RANGE', reason: `prop "${prop}" value ${value} > max ${propDef.max}` };
+			}
+			return { ok: true };
+		}
+		case 'string':
+		case 'l10n':
+		case 'image':
+		case 'sound':
+		case 'resource':
+		case 'spine-sequence':
+		case 'pow-damp-preset':
+			if (typeof value !== 'string') {
+				return { ok: false, code: 'TYPE_MISMATCH', reason: `prop "${prop}" expects string (type "${t}"), got ${typeof value}` };
+			}
+			return { ok: true };
+		case 'boolean':
+			if (typeof value !== 'boolean') {
+				return { ok: false, code: 'TYPE_MISMATCH', reason: `prop "${prop}" expects boolean, got ${typeof value}` };
+			}
+			return { ok: true };
+		case 'color': {
+			if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 0xFFFFFF) {
+				return { ok: false, code: 'TYPE_MISMATCH', reason: `prop "${prop}" expects color integer 0..0xFFFFFF, got ${JSON.stringify(value)}` };
+			}
+			return { ok: true };
+		}
+		case 'rect':
+		case 'timeline':
+		case 'curve':
+			if (value === null || typeof value !== 'object') {
+				return { ok: false, code: 'TYPE_MISMATCH', reason: `prop "${prop}" expects object (type "${t}"), got ${typeof value}` };
+			}
+			return { ok: true };
+		default:
+			// Forward-compat: engine added a new type we don't know. Per plan §5
+			// strict mode rejects unknown types so we don't silently land garbage;
+			// flip to `{ ok: true }` to make this permissive.
+			return { ok: false, code: 'UNKNOWN_TYPE', reason: `prop "${prop}" has unhandled type "${t}"` };
 	}
 }
 
@@ -66,7 +151,10 @@ const patches = JSON.parse(readFileSync(resolve(patchPath), 'utf8'));
 let applied = 0;
 let skipped = 0;
 let refused = 0;
+let typeRejected = 0;
+let typeSkipped = 0;
 const log = [];
+const rejected = []; // strict type-validation rejections (separate from refused)
 
 for (const entry of patches) {
 	const ctx = locateWithParent(scene, entry.scenePath);
@@ -87,6 +175,29 @@ for (const entry of patches) {
 		}
 	}
 
+	// Strict type validation — only when engine truth is available. Always runs
+	// (even under --force): force is for refuse-matrix overrides, not for
+	// landing a wrong-typed value.
+	if (registryIsEngineTruth) {
+		const classInfo = registry?.classes?.[node.c];
+		const tc = validatePropType(classInfo, entry.prop, entry.to);
+		if (!tc.ok) {
+			log.push(`REJECT ${tc.code} ${fmtPath(entry.scenePath)} ${entry.prop} -> ${JSON.stringify(entry.to)}  (reason: ${tc.reason})`);
+			rejected.push({
+				scenePath: entry.scenePath,
+				prop: entry.prop,
+				value: entry.to,
+				code: tc.code,
+				reason: tc.reason
+			});
+			typeRejected++;
+			continue;
+		}
+		if (tc.skip) typeSkipped++;
+	} else {
+		typeSkipped++;
+	}
+
 	if (!node.p) node.p = {};
 	const before = node.p[entry.prop];
 	node.p[entry.prop] = entry.to;
@@ -96,18 +207,34 @@ for (const entry of patches) {
 
 const serialized = JSON.stringify(scene, null, indent) + '\n';
 
+function summary(prefix) {
+	const parts = [`${applied} ${prefix}`, `${refused} refused`, `${typeRejected} type-rejected`, `${skipped} skipped`];
+	if (typeSkipped > 0 && !registryIsEngineTruth) {
+		parts.push(`TYPE_CHECK_SKIPPED (no engine classes.json — run "Project → Export Figma-Sync metadata")`);
+	}
+	return parts.join(', ');
+}
+
+if (rejected.length > 0) {
+	console.log('\nTYPE_VALIDATION_REJECTED summary:');
+	for (const r of rejected) console.log(`  ${r.code}  ${fmtPath(r.scenePath)}.${r.prop} = ${JSON.stringify(r.value)} — ${r.reason}`);
+}
+
 if (dry) {
 	console.log(log.join('\n'));
-	console.log(`\nDRY: ${applied} would apply, ${refused} refused, ${skipped} skipped`);
+	console.log(`\nDRY: ${summary('would apply')}`);
 } else {
-	if (refused > 0 && !force) {
+	if ((refused > 0 || typeRejected > 0) && !force) {
 		console.log(log.join('\n'));
-		console.log(`\nABORT: ${refused} entries refused. Re-run with --force to override, or change patch.`);
+		const blockers = [];
+		if (refused > 0) blockers.push(`${refused} refused`);
+		if (typeRejected > 0) blockers.push(`${typeRejected} type-rejected`);
+		console.log(`\nABORT: ${blockers.join(', ')}. Re-run with --force to override refuse-matrix (does NOT override type validation), or change patch.`);
 		process.exit(2);
 	}
 	writeFileSync(sceneAbs, serialized);
 	console.log(log.join('\n'));
-	console.log(`\nWROTE ${sceneAbs}: ${applied} applied, ${refused} refused, ${skipped} skipped`);
+	console.log(`\nWROTE ${sceneAbs}: ${summary('applied')}`);
 }
 
 // --- locate with parent ---
