@@ -414,37 +414,49 @@ function computeFigmaLocal(figmaLayer, figmaSnap) {
 	return { x: bbox.x - parentX, y: bbox.y - parentY };
 }
 
-// Engine-truth coord diff. Compares Figma anchor-point (in design-frame-local
-// space, scaled to engine pixels) against engine worldTransform.tx/ty. Patch
-// target selection depends on parent class and self resize state:
-//   - parent is layout-managed (LayoutGroup/Resizer/custom subclasses) → refuse
-//     with hint to tune parent layout params
-//   - self has canOverridePivotAndAnchor=true → emit normalizePosX/Y best-effort
-//     patches (preserves existing normAnchor, shifts pixel offset)
-//   - otherwise → emit local x/y patches: newLocal = oldLocal + worldDelta
-//     (assumes parent has no scale/rotation chain; phase 2C generalizes)
+// Engine-truth coord diff. Compares the rendered visual extent reported by
+// the engine (sceneNode.world.bounds = Pixi getBounds() in world space — the
+// same rectangle a player perceives) against the Figma layer's
+// absoluteBoundingBox translated into engine pixels via designScale.
+//
+// Earlier iterations used `worldTransform.tx`/`.ty` for the engine side, but
+// for Container / SizedContainer with non-zero pivot that point is the local
+// (0,0) AFTER pivot offset — NOT the visual top-left. Bounds-to-bbox is a
+// universal reference frame: for Sprite-with-anchor it equals
+// (anchor-point − anchor × size); for plain Container it equals the rendered
+// subtree extent. Both engine and Figma agree on this shape.
+//
+// Patch target selection (unchanged in spirit, but delta now derives from
+// bounds):
+//   - parent is layout-managed (LayoutGroup/Resizer/custom subclass) → refuse
+//     with hint to tune parent layout params.
+//   - self has canOverridePivotAndAnchor=true → shift normalizePosX/Y by
+//     deltaX/Y; parentW × normAnchorX is fixed across the patch, so the
+//     pixel offset is the full correction.
+//   - otherwise → shift authored x/y by deltaX/Y; engine recomputes
+//     worldTransform identically except for the translation, so bounds.x/y
+//     move by the same delta.
 function diffPositionEngineTruth(figma, sceneNode, sceneFlat, rootFrame, designScale, engineMeta, thrPx) {
 	const out = [];
 	const figmaBbox = figma.bbox;
-	if (!figmaBbox) return out;
+	const engineBounds = sceneNode.world?.bounds;
+	if (!figmaBbox || !engineBounds) return out;
 
-	const anchorX = sceneNode.localEngine?.anchor?.x ?? 0;
-	const anchorY = sceneNode.localEngine?.anchor?.y ?? 0;
-	const figmaAnchorPointX = (figmaBbox.x - rootFrame.bbox.x) + figmaBbox.width * anchorX;
-	const figmaAnchorPointY = (figmaBbox.y - rootFrame.bbox.y) + figmaBbox.height * anchorY;
-	const targetWorldX = figmaAnchorPointX * designScale;
-	const targetWorldY = figmaAnchorPointY * designScale;
-	const currentWorldX = sceneNode.world.x;
-	const currentWorldY = sceneNode.world.y;
-	const deltaX = targetWorldX - currentWorldX;
-	const deltaY = targetWorldY - currentWorldY;
+	const figmaWorldX = (figmaBbox.x - rootFrame.bbox.x) * designScale;
+	const figmaWorldY = (figmaBbox.y - rootFrame.bbox.y) * designScale;
+	const currentWorldX = engineBounds.x;
+	const currentWorldY = engineBounds.y;
+	const deltaX = figmaWorldX - currentWorldX;
+	const deltaY = figmaWorldY - currentWorldY;
+	const targetWorldX = figmaWorldX;
+	const targetWorldY = figmaWorldY;
 
 	const parentEntry = findParentSceneEntry(sceneFlat, sceneNode.path);
 	const parentLayoutManaged = parentEntry ? isLayoutManaged(parentEntry.class) : false;
 	const canOverride = !!sceneNode.resizeEngine?.canOverridePivotAndAnchor;
 
 	const reason = (axis, target, current) =>
-		`engine-truth: figma anchor-point ${axis}=${round(axis === 'x' ? figmaAnchorPointX : figmaAnchorPointY)} (×${designScale.toFixed(4)} → ${round(target)}); engine world ${axis}=${round(current)}; Δ=${round(target - current)}px`;
+		`engine-truth: figma bounds.${axis}=${round(axis === 'x' ? figmaWorldX : figmaWorldY)} (designScale ${designScale.toFixed(4)}); engine bounds.${axis}=${round(current)}; Δ=${round(target - current)}px`;
 
 	if (parentLayoutManaged) {
 		if (Math.abs(deltaX) > thrPx) {
@@ -475,38 +487,15 @@ function diffPositionEngineTruth(figma, sceneNode, sceneFlat, rootFrame, designS
 	}
 
 	if (canOverride) {
-		// Resizer engine formula (resize-attrib.ts): targetWorldPos =
-		// parentWorldOrigin + parentSize × normAnchor + normalizePos.
-		// useWorld=true means parentSize references game.W/H instead of parent bounds.
-		const useWorld = !!sceneNode.resizeEngine?.useWorld;
-		const parentWorldX = parentEntry?.world?.x ?? 0;
-		const parentWorldY = parentEntry?.world?.y ?? 0;
-		// Engine's resize formula references the parent's OWN width/height, not
-		// its recursive subtree bounds. Engine snapshot now exports localEngine
-		// .width/.height for containers that have it. Fallback chain:
-		//   1. parent.localEngine.width (engine-truth own width)
-		//   2. parent.props.width (authored)
-		//   3. parent.localEngine.pivot.x × 2 (heuristic: SizedContainer pivot
-		//      defaults to center, so center × 2 ≈ width)
-		//   4. game.W (when useWorld=true OR all else fails)
-		const parentWidth = useWorld
-			? engineMeta.gameSize.W
-			: (parentEntry?.localEngine?.width
-				?? parentEntry?.props?.width
-				?? (parentEntry?.localEngine?.pivotX != null ? parentEntry.localEngine.pivotX * 2 : null)
-				?? engineMeta.gameSize.W);
-		const parentHeight = useWorld
-			? engineMeta.gameSize.H
-			: (parentEntry?.localEngine?.height
-				?? parentEntry?.props?.height
-				?? (parentEntry?.localEngine?.pivotY != null ? parentEntry.localEngine.pivotY * 2 : null)
-				?? engineMeta.gameSize.H);
-		const normAnchorX = sceneNode.resizeEngine?.normAnchorX ?? 0;
-		const normAnchorY = sceneNode.resizeEngine?.normAnchorY ?? 0;
-		const newNormalizePosX = (targetWorldX - parentWorldX) - parentWidth * normAnchorX;
-		const newNormalizePosY = (targetWorldY - parentWorldY) - parentHeight * normAnchorY;
+		// canOverridePivotAndAnchor=true means engine recomputes self.x/y each
+		// frame as: self.x = parentW × normAnchorX + normalizePosX (mirror for
+		// Y). Shifting normalizePosX by deltaX translates the container — and
+		// therefore its world.bounds — by exactly deltaX. No parent-width
+		// derivation is required.
 		const curNormalizePosX = sceneNode.props?.normalizePosX ?? 0;
 		const curNormalizePosY = sceneNode.props?.normalizePosY ?? 0;
+		const newNormalizePosX = curNormalizePosX + deltaX;
+		const newNormalizePosY = curNormalizePosY + deltaY;
 
 		if (Math.abs(deltaX) > thrPx) {
 			out.push({
@@ -514,11 +503,9 @@ function diffPositionEngineTruth(figma, sceneNode, sceneFlat, rootFrame, designS
 				prop: 'normalizePosX',
 				from: curNormalizePosX,
 				to: round(newNormalizePosX),
-				delta: round(newNormalizePosX - curNormalizePosX),
+				delta: round(deltaX),
 				severity: 'patch',
-				reason: reason('x', targetWorldX, currentWorldX) +
-					`; canOverride=true → patching normalizePosX (parentW=${round(parentWidth)}, normAnchorX=${normAnchorX})`,
-				confidence: useWorld ? 'high' : 'approximate'
+				reason: reason('x', targetWorldX, currentWorldX) + '; canOverride=true → shifting normalizePosX'
 			});
 		}
 		if (Math.abs(deltaY) > thrPx) {
@@ -527,11 +514,9 @@ function diffPositionEngineTruth(figma, sceneNode, sceneFlat, rootFrame, designS
 				prop: 'normalizePosY',
 				from: curNormalizePosY,
 				to: round(newNormalizePosY),
-				delta: round(newNormalizePosY - curNormalizePosY),
+				delta: round(deltaY),
 				severity: 'patch',
-				reason: reason('y', targetWorldY, currentWorldY) +
-					`; canOverride=true → patching normalizePosY (parentH=${round(parentHeight)}, normAnchorY=${normAnchorY})`,
-				confidence: useWorld ? 'high' : 'approximate'
+				reason: reason('y', targetWorldY, currentWorldY) + '; canOverride=true → shifting normalizePosY'
 			});
 		}
 		return out;
