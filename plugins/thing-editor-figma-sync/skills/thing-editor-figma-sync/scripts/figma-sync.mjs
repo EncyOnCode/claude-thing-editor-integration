@@ -34,6 +34,9 @@ const projectRoot = flagValue('--project');
 const onlyScene = flagValue('--scene');
 const apply = flagPresent('--apply');
 const forceApply = flagPresent('--force-apply');
+const revertScene = flagValue('--revert');
+const revertAll = flagPresent('--revert-all');
+const yes = flagPresent('--yes');
 // Phase D defaults — gate thresholds. Per-scene override via figma.sync.json:
 // `gateRatioDynamic` (number 0..1) and `gatePatchesProposed` (number).
 const GATE_RATIO_DYNAMIC_DEFAULT = 0.5;
@@ -50,9 +53,20 @@ const excludePattern = flagValue('--exclude-pattern');
 const excludeClass = flagValue('--exclude-class');
 
 if (!projectRoot) {
-	console.error('usage: figma-sync.mjs --project <path> [--scene <name>] [--apply] [--threshold 0.95]');
+	console.error('usage: figma-sync.mjs --project <path> [--scene <name>] [--apply | --force-apply] [--threshold 0.95]');
+	console.error('       figma-sync.mjs --project <path> --revert <sceneName> [--yes]');
+	console.error('       figma-sync.mjs --project <path> --revert-all [--yes]');
 	process.exit(2);
 }
+
+// Phase E — revert mode runs before any Figma work. Bails the whole process
+// without touching FIGMA_TOKEN / figma.sync.json validation paths.
+if (revertScene || revertAll) {
+	const projectAbsForRevert = resolve(projectRoot);
+	const exitCode = runRevert(projectAbsForRevert, revertScene, revertAll, yes);
+	process.exit(exitCode);
+}
+
 if (!process.env.FIGMA_TOKEN) {
 	console.error('error: FIGMA_TOKEN env var required');
 	process.exit(2);
@@ -86,6 +100,77 @@ const report = {
 	scenes: [],
 	summary: { total: 0, pass: 0, drift: 0, error: 0 }
 };
+
+// Phase E — revert helper. Restores scene files to their git baseline. Refuses
+// if the project is not a git repo or the scene isn't tracked. Requires --yes
+// for the actual checkout step; without it, just prints what would be reverted.
+function runRevert(projectAbs, sceneName, revertAllFlag, yesFlag) {
+	const isRepo = spawnSync('git', ['-C', projectAbs, 'rev-parse', '--git-dir'], { encoding: 'utf8' });
+	if (isRepo.status !== 0) {
+		console.error(`error: ${projectAbs} is not a git repo (or no git baseline). Cannot revert.`);
+		return 2;
+	}
+
+	let configRaw;
+	try {
+		configRaw = readFileSync(join(projectAbs, 'figma.sync.json'), 'utf8');
+	} catch {
+		configRaw = null;
+	}
+	const cfg = configRaw ? JSON.parse(configRaw) : null;
+	const sceneNames = revertAllFlag
+		? (cfg?.scenes ? Object.keys(cfg.scenes) : [])
+		: [sceneName];
+	if (sceneNames.length === 0 || !sceneNames[0]) {
+		console.error('error: --revert needs a scene name; --revert-all needs figma.sync.json with at least one scene listed.');
+		return 2;
+	}
+
+	const targets = sceneNames.map(n => ({
+		name: n,
+		relPath: `assets/${n}.s.json`,
+		absPath: join(projectAbs, 'assets', `${n}.s.json`)
+	}));
+
+	let touchedAny = false;
+	for (const t of targets) {
+		if (!existsSync(t.absPath)) {
+			console.error(`  ${t.relPath}: file not found, skipping`);
+			continue;
+		}
+		// Check if tracked.
+		const lsTree = spawnSync('git', ['-C', projectAbs, 'ls-files', '--error-unmatch', t.relPath], { encoding: 'utf8' });
+		if (lsTree.status !== 0) {
+			console.error(`  ${t.relPath}: not tracked by git, skipping`);
+			continue;
+		}
+		// Check if dirty.
+		const diff = spawnSync('git', ['-C', projectAbs, 'diff', '--quiet', '--', t.relPath], { encoding: 'utf8' });
+		if (diff.status === 0) {
+			console.error(`  ${t.relPath}: clean, nothing to revert`);
+			continue;
+		}
+		touchedAny = true;
+		const stat = spawnSync('git', ['-C', projectAbs, 'diff', '--stat', '--', t.relPath], { encoding: 'utf8' });
+		console.error(`  ${t.relPath}: ${(stat.stdout || '').trim().split('\n').pop()}`);
+		if (yesFlag) {
+			const checkout = spawnSync('git', ['-C', projectAbs, 'checkout', '--', t.relPath], { encoding: 'utf8' });
+			if (checkout.status !== 0) {
+				console.error(`    error: git checkout failed: ${checkout.stderr}`);
+				return 1;
+			}
+			console.error(`    reverted to HEAD`);
+		}
+	}
+	if (!touchedAny) {
+		console.error('no scene files needed reverting.');
+		return 0;
+	}
+	if (!yesFlag) {
+		console.error('\ndry-run (no --yes). Re-run with --yes to actually revert.');
+	}
+	return 0;
+}
 
 // scene-walker args builder — forwards per-project dynamic-class names so the
 // walker's isDynamic heuristic picks up project-specific patterns.
