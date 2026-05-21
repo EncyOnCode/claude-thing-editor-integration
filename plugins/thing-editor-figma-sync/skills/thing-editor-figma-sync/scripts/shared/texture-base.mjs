@@ -15,9 +15,42 @@ const ATLAS_FILES = ['assets-preloader.json', 'assets-main.json', 'assets-delaye
 const TMP_PATHS = ['.tmp', 'tmp'];
 const IMG_PATHS = ['assets/img', 'assets/images'];
 
+// Engine-emitted asset index (.thing-editor-meta/assets.json) — preferred when
+// present. Memoized per process per projectRoot.
+const ASSET_INDEX_CACHE = new Map();
+
+function loadAssetIndex(projectRoot) {
+	if (ASSET_INDEX_CACHE.has(projectRoot)) return ASSET_INDEX_CACHE.get(projectRoot);
+	const metaPath = join(projectRoot, '.thing-editor-meta', 'assets.json');
+	if (!existsSync(metaPath)) {
+		ASSET_INDEX_CACHE.set(projectRoot, null);
+		return null;
+	}
+	try {
+		const data = JSON.parse(readFileSync(metaPath, 'utf8'));
+		ASSET_INDEX_CACHE.set(projectRoot, data);
+		return data;
+	} catch {
+		ASSET_INDEX_CACHE.set(projectRoot, null);
+		return null;
+	}
+}
+
 export function resolveTextureBase(assetName, projectRoot) {
 	if (!projectRoot) return null;
 	const root = resolve(projectRoot);
+
+	// 0. Engine-emitted asset index — fast path. Texture dims rarely change
+	// without a manual re-export, and the fallback chain is still correct on
+	// miss, so no mtime freshness check here.
+	const idx = loadAssetIndex(root);
+	if (idx?.textures) {
+		const hit = idx.textures[assetName] || idx.textures[assetName + '.png'];
+		if (hit && typeof hit.width === 'number' && typeof hit.height === 'number'
+			&& hit.width > 0 && hit.height > 0) {
+			return { width: hit.width, height: hit.height };
+		}
+	}
 
 	// 1. Atlas frames in .tmp/
 	for (const tmpDir of TMP_PATHS) {
