@@ -128,9 +128,13 @@ function subtreeHasText(node) {
 }
 
 function deriveIsDynamic(cls, chain, prefabRef, parentIsLayoutManaged, parentIsDynamic) {
+	// Note: parent-layout-managed alone does NOT mark a node dynamic. Layout-
+	// managed children can be patched safely via normalizePos*/normAnchor*
+	// (the refuse-matrix already rewrites x/y → norm* for these). Excluding
+	// them entirely would block legitimate coord fixes (proven on
+	// livegames-checkers where `bet` patches landed correctly via normalizePos).
 	if (parentIsDynamic) return { isDynamic: true, reason: 'ancestor' };
 	if (prefabRef) return { isDynamic: true, reason: `prefabRef:${prefabRef}` };
-	if (parentIsLayoutManaged) return { isDynamic: true, reason: 'parent-layout-managed' };
 	if (!cls) return { isDynamic: false, reason: null };
 	if (DYNAMIC_ENGINE_CLASSES.has(cls)) return { isDynamic: true, reason: `class:${cls}` };
 	if (extraDynamicClasses && extraDynamicClasses.has(cls)) return { isDynamic: true, reason: `project-class:${cls}` };
