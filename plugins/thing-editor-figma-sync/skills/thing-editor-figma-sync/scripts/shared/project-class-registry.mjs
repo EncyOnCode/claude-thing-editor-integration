@@ -50,6 +50,14 @@ const CACHE_DIR = '.figma-sync-cache';
 const CACHE_FILE = 'classes.json';
 const CACHE_VERSION = 1;
 
+// Engine-emitted registry — written by thing-editor's
+// `Project → Export Figma-Sync metadata` menu (or .command.json channel).
+// When present and fresh, preferred over regex scanner — it carries authoritative
+// __editableProps/__defaultValues that the scanner cannot derive from source.
+const ENGINE_META_DIR = '.thing-editor-meta';
+const ENGINE_CLASSES_FILE = 'classes.json';
+const ENGINE_REGISTRY_VERSION = 'engine-1';
+
 function readJsonSafe(path) {
 	try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
 }
@@ -182,6 +190,111 @@ function classifySource(filePath, scanRoots) {
 	return 'unknown';
 }
 
+// Engine emits source as 'engine' | 'project' | 'lib'. Consumers downstream
+// branch on tag startsWith('lib:') / === 'project' / === 'engine'. Recover the
+// specific lib name from the file path so downstream filters still work.
+function normalizeEngineSource(rawSource, file) {
+	if (rawSource === 'project' || rawSource === 'engine') return rawSource;
+	if (rawSource === 'lib') {
+		const m = /\/libs\/([^/]+)\//.exec(file);
+		return m ? `lib:${m[1]}` : 'lib:unknown';
+	}
+	return rawSource || 'unknown';
+}
+
+// Engine path may be absolute (e.g. /thing-editor/src/engine/lib/...) or already
+// relative. Normalize against monorepoRoot to match the scanner's output.
+function normalizeEngineFilePath(file, monorepoRoot) {
+	if (!file) return file;
+	if (file.startsWith('/thing-editor/')) {
+		// Engine paths emitted by classes-loader.ts are root-relative to monorepo.
+		return file.replace(/^\/+/, '');
+	}
+	try { return relative(monorepoRoot, resolve(monorepoRoot, file.replace(/^\/+/, ''))); }
+	catch { return file; }
+}
+
+function maxMtimeMs(files) {
+	let m = 0;
+	for (const f of files) {
+		try {
+			const s = statSync(f);
+			if (s.mtimeMs > m) m = s.mtimeMs;
+		} catch { /* ignore */ }
+	}
+	return m;
+}
+
+function engineRegistryIsFresh(metaPath, scannedFiles) {
+	try {
+		const metaStat = statSync(metaPath);
+		const newest = maxMtimeMs(scannedFiles);
+		return metaStat.mtimeMs >= newest;
+	} catch {
+		return false;
+	}
+}
+
+// Normalize engine JSON into the same shape consumers expect from the regex
+// scanner. Preserves all required fields; adds __editableProps / __defaultValues
+// for the Phase 5 type-validation consumer. `hooks` is null (engine JSON has no
+// hook detection — consumers must null-guard).
+function normalizeEngineClasses(rawJson, monorepoRoot, projectRoot, buildHash) {
+	const classes = {};
+	const raw = rawJson?.classes || {};
+	for (const name of Object.keys(raw)) {
+		const e = raw[name];
+		const file = normalizeEngineFilePath(e.file, monorepoRoot);
+		const extendsArr = Array.isArray(e.extends) ? e.extends : [];
+		const chain = [name, ...extendsArr];
+		const { anchor, isText, isLayoutManaged } = classifyChain(chain);
+		classes[name] = {
+			file,
+			extends: extendsArr[0] || null,
+			chain,
+			anchor,
+			isText,
+			isLayoutManaged,
+			hooks: null,
+			source: normalizeEngineSource(e.source, file),
+			// Engine-only fields. Consumers that don't know about them ignore them;
+			// apply-patch.mjs (Phase 5) uses them for type validation.
+			__editableProps: Array.isArray(e.editableProps) ? e.editableProps : [],
+			__defaultValues: e.defaultValues || {},
+			__icon: e.icon || null,
+			__isScene: !!e.isScene
+		};
+	}
+	return {
+		version: ENGINE_REGISTRY_VERSION,
+		buildHash,
+		generatedAt: rawJson?.generatedAt || new Date().toISOString(),
+		projectRoot,
+		monorepoRoot,
+		scanRoots: [],
+		fileCount: Object.keys(classes).length,
+		classes,
+		conflicts: [],
+		unresolved: []
+	};
+}
+
+function tryLoadEngineRegistry(absProject, scannedFiles, monorepoRoot, buildHash) {
+	const metaPath = join(absProject, ENGINE_META_DIR, ENGINE_CLASSES_FILE);
+	if (!existsSync(metaPath)) return null;
+	if (!engineRegistryIsFresh(metaPath, scannedFiles)) {
+		console.error(
+			'[project-class-registry] engine classes.json found but stale ' +
+			'(.c.ts newer than .thing-editor-meta/classes.json) — falling back to regex scanner. ' +
+			'Run "Project → Export Figma-Sync metadata" in editor to refresh.'
+		);
+		return null;
+	}
+	const raw = readJsonSafe(metaPath);
+	if (!raw || !raw.classes) return null;
+	return normalizeEngineClasses(raw, monorepoRoot, absProject, buildHash);
+}
+
 export function loadRegistry(projectRoot, opts = {}) {
 	const absProject = resolve(projectRoot);
 	const projConfig = readJsonSafe(join(absProject, 'thing-project.json'));
@@ -227,6 +340,16 @@ export function loadRegistry(projectRoot, opts = {}) {
 	}
 
 	const buildHash = hashFiles(allFiles);
+
+	// Engine-truth path: if `.thing-editor-meta/classes.json` exists and is
+	// fresher than every scanned .c.ts, prefer it. Carries authoritative
+	// __editableProps that the regex scanner cannot derive. Falls back to the
+	// regex path on absence, staleness, or parse failure.
+	if (!opts.rebuild && !opts.forceRegex) {
+		const engineReg = tryLoadEngineRegistry(absProject, allFiles, monorepoRoot, buildHash);
+		if (engineReg) return engineReg;
+	}
+
 	const cachePath = join(absProject, CACHE_DIR, CACHE_FILE);
 	if (!opts.rebuild && existsSync(cachePath)) {
 		const cached = readJsonSafe(cachePath);
