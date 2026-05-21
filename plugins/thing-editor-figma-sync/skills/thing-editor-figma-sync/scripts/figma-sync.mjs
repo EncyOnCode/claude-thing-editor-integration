@@ -33,6 +33,11 @@ function flagPresent(name) { return args.includes(name); }
 const projectRoot = flagValue('--project');
 const onlyScene = flagValue('--scene');
 const apply = flagPresent('--apply');
+const forceApply = flagPresent('--force-apply');
+// Phase D defaults — gate thresholds. Per-scene override via figma.sync.json:
+// `gateRatioDynamic` (number 0..1) and `gatePatchesProposed` (number).
+const GATE_RATIO_DYNAMIC_DEFAULT = 0.5;
+const GATE_PATCHES_PROPOSED_DEFAULT = 100;
 const threshold = Number(flagValue('--threshold') ?? '0.95');
 const regionThreshold = Number(flagValue('--ssim-region-threshold') ?? '0.85');
 const outReport = flagValue('--out-report');
@@ -188,9 +193,46 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 		const diffReport = JSON.parse(readFileSync(diffReportPath, 'utf8'));
 		sceneReport.steps.push({ step: 'diff', ok: true, matched: diffReport.summary.matched, patches: diffReport.summary.patches });
 
+		// Phase D — drift profile + pre-apply gate. Refuses auto-apply on
+		// projects where most matches look runtime-driven OR patch count is
+		// huge. --force-apply overrides; the gate prints a human-readable
+		// review prompt with the patch file path.
+		const totalConsidered = (diffReport.summary.matched ?? 0) + (diffReport.summary.excluded ?? 0);
+		const ratioDynamic = totalConsidered > 0 ? (diffReport.summary.excluded ?? 0) / totalConsidered : 0;
+		const driftProfile = {
+			totalMatches: diffReport.summary.matched ?? 0,
+			excludedMatches: diffReport.summary.excluded ?? 0,
+			patchesProposed: diffReport.summary.patches ?? 0,
+			fuzzyMatches: diffReport.summary.fuzzyMatches ?? 0,
+			ratioDynamic: Number(ratioDynamic.toFixed(3))
+		};
+		sceneReport.driftProfile = driftProfile;
+		const gateRatio = sceneCfg.gateRatioDynamic ?? GATE_RATIO_DYNAMIC_DEFAULT;
+		const gatePatches = sceneCfg.gatePatchesProposed ?? GATE_PATCHES_PROPOSED_DEFAULT;
+		const gateTriggered = (driftProfile.ratioDynamic > gateRatio) ||
+			(driftProfile.patchesProposed > gatePatches);
+		const gateReasons = [];
+		if (driftProfile.ratioDynamic > gateRatio) {
+			gateReasons.push(`ratioDynamic=${driftProfile.ratioDynamic} > ${gateRatio}`);
+		}
+		if (driftProfile.patchesProposed > gatePatches) {
+			gateReasons.push(`patchesProposed=${driftProfile.patchesProposed} > ${gatePatches}`);
+		}
+		if (apply && gateTriggered && !forceApply) {
+			sceneReport.status = 'review-required';
+			sceneReport.gateReasons = gateReasons;
+			sceneReport.steps.push({ step: 'gate', triggered: true, reasons: gateReasons });
+			console.error(`\n!!! REVIEW-REQUIRED: scene "${sceneName}" — skipping auto-apply for safety`);
+			console.error(`    reasons: ${gateReasons.join('; ')}`);
+			console.error(`    drift profile: ${JSON.stringify(driftProfile)}`);
+			console.error(`    review patches: cat ${patchesPath} | jq '.'`);
+			console.error(`    to apply anyway: re-run with --force-apply`);
+			console.error(`    to exclude specific subtrees: add excludeClasses / excludePatterns / excludeScenePathPrefixes to figma.sync.json`);
+		}
+
 		// 5. Optionally apply auto-confidence patches.
 		let appliedCount = 0;
-		if (apply && diffReport.diffs.length > 0) {
+		if (apply && diffReport.diffs.length > 0 && (!gateTriggered || forceApply)) {
 			const matchesByPath = new Map(diffReport.matches.map(m => [JSON.stringify(m.scenePath), m]));
 			const toApply = diffReport.diffs.filter(d => {
 				if (d.severity !== 'patch') return false;
@@ -204,7 +246,17 @@ for (const [sceneName, sceneCfg] of sceneEntries) {
 				console.error(`-> applying ${toApply.length} auto-confidence patches`);
 				const applyRes = runNode('apply-patch.mjs', [scenePath, filteredPatchesPath, '--project', projectAbs]);
 				if (applyRes.code !== 0 && applyRes.code !== 2) throw new Error(`apply-patch failed: ${applyRes.stderr}`);
-				appliedCount = toApply.length;
+				// Parse the "WROTE ...: N applied, X refused, Y type-rejected, Z skipped" footer.
+				// On exit-2 (ABORT) the file isn't written — applied stays 0.
+				const wroteMatch = /WROTE\s+\S+:\s+(\d+)\s+applied/.exec(applyRes.stdout || '');
+				if (applyRes.code === 0 && wroteMatch) {
+					appliedCount = Number(wroteMatch[1]);
+				} else if (applyRes.code === 2) {
+					appliedCount = 0;
+					console.error(`   warn: apply-patch ABORTED (exit 2); scene file unchanged. See report flags.`);
+				} else {
+					appliedCount = toApply.length;
+				}
 
 				// Re-export after apply so SSIM compares the new state.
 				await openSceneViaCommand(projectAbs, sceneName, { forceDiscard: true });
