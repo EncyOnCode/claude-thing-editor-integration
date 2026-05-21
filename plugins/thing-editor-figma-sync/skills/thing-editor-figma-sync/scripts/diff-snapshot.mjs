@@ -12,6 +12,7 @@
 //     [--patch-out <path>]
 //     [--auto-apply]
 //     [--screenshot <path.png>]   # Workflow D — deferred, prints message
+//     [--tokens <variables.json>] # Pattern A soft DS — variables from fetch-figma-vars.mjs
 //
 // Exit codes: 0 success, 1 if any 'refuse' severity diffs.
 
@@ -23,6 +24,14 @@ import { mdDiffReport, jsonReport } from './shared/report-format.mjs';
 import { readConnectMap, findMapping } from './shared/connect-map.mjs';
 import { extendTokens, isLayoutManaged, isTextClass } from './shared/class-tokens.mjs';
 import { loadRegistry } from './shared/project-class-registry.mjs';
+import { findSceneMatches } from './shared/match-strategy.mjs';
+import {
+	loadFigmaTokensConfig,
+	loadFigmaVariables,
+	resolveBoundVariable,
+	findEngineMappingFor,
+	normalizeHex
+} from './shared/figma-tokens.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -40,6 +49,7 @@ const reportJsonPath = flagValue('--report-json');
 const patchOutPath = flagValue('--patch-out');
 const screenshotPath = flagValue('--screenshot');
 const projectRoot = flagValue('--project');
+const tokensPath = flagValue('--tokens');
 const autoApply = flagPresent('--auto-apply');
 const strict = flagPresent('--strict');
 const thrPx = strict ? 0 : (Number(flagValue('--threshold-px')) || 1);
@@ -57,6 +67,29 @@ if (projectRoot) {
 		extendTokens(loadRegistry(projectRoot));
 	} catch (e) {
 		console.error(`warn: failed to load class registry: ${e.message}`);
+	}
+}
+
+// Pattern A (soft) Design System support. Both inputs are opt-in:
+//   --tokens <path>   variables JSON from fetch-figma-vars.mjs
+//   <project>/figma.tokens.json   manual engine-side mapping
+// When present, the diff emits DS_TOKEN_HINT info-level flags alongside raw
+// tint/fontSize patches; raw patches themselves are unchanged.
+let figmaVariables = null;
+let tokensConfig = null;
+if (tokensPath) {
+	try {
+		figmaVariables = loadFigmaVariables(tokensPath);
+		console.error(`info: loaded ${Object.keys(figmaVariables.byId).length} Figma variables from ${tokensPath}`);
+	} catch (e) {
+		console.error(`warn: failed to load --tokens ${tokensPath}: ${e.message}`);
+	}
+}
+if (projectRoot) {
+	tokensConfig = loadFigmaTokensConfig(projectRoot);
+	if (tokensConfig) {
+		const total = Object.keys(tokensConfig.colors).length + Object.keys(tokensConfig.fontSizes).length + Object.keys(tokensConfig.textStyles).length;
+		console.error(`info: loaded figma.tokens.json with ${total} mappings from ${tokensConfig._path}`);
 	}
 }
 
@@ -95,7 +128,11 @@ const matches = [];
 const unmatchedFigma = [];
 const unmatchedScene = new Set(Object.keys(sceneFlat));
 const flags = [];
-
+// Two-pass: collect proposals first so we can resolve scene-key conflicts by
+// confidence. Without this, two figma layers can claim the same scene entry
+// and the second one's bbox produces noise diffs (e.g. a Frame overlapping
+// "bet" hijacks bet's position diff from the actual "bet" figma layer).
+const proposals = [];
 for (const layer of Object.values(figmaSnap.layers)) {
 	if (layer.skip) continue;
 	if (!layer.identifier) {
@@ -103,23 +140,79 @@ for (const layer of Object.values(figmaSnap.layers)) {
 		continue;
 	}
 
-	// Try matching by namePath (scene flat keyed by namePath)
-	const candidates = findSceneMatches(sceneFlat, layer);
-	if (candidates.length === 0) {
-		// Try connect-map by componentId/componentSetId
-		const cm = connectMap && findMapping(connectMap, { id: layer.id, componentSetId: layer.componentSetId });
-		if (cm && cm.scenePath) {
-			matches.push({ figma: layer, scene: findByPath(sceneFlat, cm.scenePath), matchedBy: 'connectMap' });
-			unmatchedScene.delete(findEntryKey(sceneFlat, cm.scenePath));
-			continue;
-		}
-		unmatchedFigma.push({ figmaId: layer.id, name: layer.name, type: layer.type });
+	const cm = connectMap && findMapping(connectMap, { id: layer.id, componentSetId: layer.componentSetId });
+	if (cm && cm.scenePath) {
+		const cmEntry = findByPath(sceneFlat, cm.scenePath);
+		const cmKey = findEntryKey(sceneFlat, cm.scenePath);
+		proposals.push({
+			layer,
+			candidates: cmEntry ? [{ key: cmKey, entry: cmEntry, matchedBy: 'connectMap', confidence: 'connectMap', namePath: cmEntry.namePath }] : []
+		});
 		continue;
 	}
 
-	const best = candidates[0];
-	matches.push({ figma: layer, scene: best.entry, matchedBy: best.matchedBy, namePath: best.namePath });
-	unmatchedScene.delete(best.key);
+	const candidates = findSceneMatches(sceneFlat, layer, figmaSnap, {
+		designScale,
+		engineMeta,
+		figmaRootFrame
+	});
+	proposals.push({ layer, candidates });
+}
+
+// Resolve in two passes: first claim by high-confidence candidates (so they
+// can't be hijacked by a later bbox match), then sweep remaining figma layers
+// against unclaimed scene keys.
+const claimedKeys = new Set();
+const layerAssigned = new Map();
+
+function claim(proposal) {
+	for (const cand of proposal.candidates) {
+		if (claimedKeys.has(cand.key)) continue;
+		claimedKeys.add(cand.key);
+		layerAssigned.set(proposal.layer.id, cand);
+		return cand;
+	}
+	return null;
+}
+
+// Pass 1: high-confidence claims (namePath, connectMap, pathSuffix).
+for (const p of proposals) {
+	const top = p.candidates[0];
+	if (!top) continue;
+	if (top.confidence === 'high' || top.confidence === 'connectMap' || top.confidence === 'medium') {
+		claim(p);
+	}
+}
+// Pass 2: fall through to low-confidence (fuzzy, bbox).
+for (const p of proposals) {
+	if (layerAssigned.has(p.layer.id)) continue;
+	claim(p);
+}
+
+// Materialize matches in figma-layer order.
+for (const p of proposals) {
+	const chosen = layerAssigned.get(p.layer.id);
+	if (!chosen) {
+		unmatchedFigma.push({ figmaId: p.layer.id, name: p.layer.name, type: p.layer.type });
+		continue;
+	}
+	matches.push({
+		figma: p.layer,
+		scene: chosen.entry,
+		matchedBy: chosen.matchedBy,
+		confidence: chosen.confidence,
+		namePath: chosen.namePath
+	});
+	if (chosen.confidence !== 'high') {
+		const level = (chosen.confidence === 'low' || chosen.confidence === 'bbox') ? 'warn' : 'info';
+		flags.push({
+			scenePath: chosen.entry.path,
+			code: 'MATCH_FUZZY',
+			level,
+			message: `Figma "${p.layer.name}" → scene "${chosen.namePath}" matched by ${chosen.matchedBy} (confidence ${chosen.confidence}${chosen.score != null ? `, score ${Number(chosen.score).toFixed(2)}` : ''})`
+		});
+	}
+	unmatchedScene.delete(chosen.key);
 }
 
 // Compute diffs
@@ -213,6 +306,10 @@ for (const { figma, scene } of matches) {
 			severity: 'patch',
 			reason: `Figma fill 0x${figmaTint.toString(16).padStart(6, '0')}, scene tint 0x${sceneTint.toString(16).padStart(6, '0')}`
 		});
+		// Pattern A soft DS hint: if the figma layer's fill is bound to a
+		// Variable, surface the variable name + engine-side mapping (if any).
+		// We do NOT alter the patch — raw tint patch still applies.
+		emitDSTokenHints(sceneNode, figma, 'fills', figmaTint);
 	}
 
 	// Text content
@@ -241,6 +338,7 @@ for (const { figma, scene } of matches) {
 				severity: 'patch',
 				reason: `Figma fontSize ${figma.style.fontSize}, scene ${sceneFontSize}`
 			});
+			emitDSTokenHints(sceneNode, figma, 'fontSize', figma.style.fontSize);
 		}
 	}
 }
@@ -363,17 +461,6 @@ function loadSceneFlat(path) {
 		process.exit(2);
 	}
 	return JSON.parse(res.stdout);
-}
-
-function findSceneMatches(sceneFlat, figmaLayer) {
-	const results = [];
-	// Try by identifier (leaf name match)
-	for (const [key, entry] of Object.entries(sceneFlat)) {
-		if (entry.name === figmaLayer.identifier) {
-			results.push({ key, entry, matchedBy: 'namePath', namePath: entry.namePath });
-		}
-	}
-	return results;
 }
 
 function findByPath(sceneFlat, path) {
@@ -649,4 +736,54 @@ function extractTintFromFills(fills) {
 function round(n, places = 2) {
 	const m = Math.pow(10, places);
 	return Math.round(n * m) / m;
+}
+
+// Pattern A soft DS hint emitter. Inspects a figma layer's `boundVariables`
+// for the given field (e.g. 'fills' for tint, 'fontSize' for text), resolves
+// the variable to a name + value via the loaded variables map, and pushes a
+// DS_TOKEN_HINT info-level flag into the shared `flags` array.
+//
+// Two branches:
+//   - mapping found in figma.tokens.json → suggest the engine token path.
+//   - no mapping → tell the user to run scaffold-tokens.mjs.
+//
+// Does NOT alter the diff patch — Pattern A is warnings-only.
+function emitDSTokenHints(sceneNode, figmaLayer, field, rawValue) {
+	if (!figmaVariables) return;
+	if (!figmaLayer?.boundVariables) return;
+	const bound = resolveBoundVariable(figmaLayer, figmaVariables);
+	const matchingField = bound.filter(b => b.field === field);
+	if (matchingField.length === 0) return;
+	for (const b of matchingField) {
+		if (!b.variableName) {
+			flags.push({
+				scenePath: sceneNode.path,
+				code: 'DS_TOKEN_HINT',
+				level: 'info',
+				message: `Figma ${field} bound to variable id ${b.variableId} (name not resolvable; re-fetch variables JSON).`
+			});
+			continue;
+		}
+		const mapping = tokensConfig ? findEngineMappingFor(tokensConfig, b.variableName) : null;
+		if (mapping && mapping.engineToken) {
+			const rawHex = typeof rawValue === 'number' && field === 'fills'
+				? `0x${rawValue.toString(16).padStart(6, '0')}`
+				: String(rawValue);
+			flags.push({
+				scenePath: sceneNode.path,
+				code: 'DS_TOKEN_HINT',
+				level: 'info',
+				message: `Figma ${field} bound to variable "${b.variableName}" → engine token "${mapping.engineToken}" available. Consider patching token reference instead of raw value ${rawHex}.`
+			});
+		} else {
+			flags.push({
+				scenePath: sceneNode.path,
+				code: 'DS_TOKEN_HINT',
+				level: 'info',
+				message: tokensConfig
+					? `Figma ${field} bound to variable "${b.variableName}" but no figma.tokens.json mapping. Add an "engineToken" entry under "${field === 'fills' ? 'colors' : 'fontSizes'}.${b.variableName}".`
+					: `Figma ${field} bound to variable "${b.variableName}" but no figma.tokens.json mapping. Run scaffold-tokens.mjs.`
+			});
+		}
+	}
 }

@@ -73,7 +73,8 @@ function walk(node, parentPath, parentBox) {
 		characters: node.characters ?? null,
 		fontSize: node.style?.fontSize ?? null,
 		fontFamily: node.style?.fontFamily ?? null,
-		textAlignHorizontal: node.style?.textAlignHorizontal ?? null
+		textAlignHorizontal: node.style?.textAlignHorizontal ?? null,
+		boundVariables: node.boundVariables ?? null
 	};
 
 	(node.children || []).forEach(child => walk(child, path, bbox));

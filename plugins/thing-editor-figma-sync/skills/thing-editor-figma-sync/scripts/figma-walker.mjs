@@ -117,6 +117,7 @@ function walkTree(node, parentPath, parentBox, layers) {
 		componentId: node.componentId ?? null,
 		componentSetId: node.componentSetId ?? null,
 		componentProperties: node.componentProperties ?? null,
+		boundVariables: node.boundVariables ?? null,
 		parentPath: parentPath || null
 	};
 
@@ -166,6 +167,7 @@ function walkFromFetchFigmaShape(raw) {
 			fills: deSimplifyFills(n.fills),
 			characters: n.characters,
 			style: fakeNode.style,
+			boundVariables: n.boundVariables ?? null,
 			parentPath
 		};
 	}
