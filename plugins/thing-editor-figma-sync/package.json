@@ -1,0 +1,14 @@
+{
+  "name": "thing-editor-figma-sync",
+  "private": true,
+  "type": "module",
+  "description": "Plugin scripts for syncing Thing-Editor scenes with Figma designs.",
+  "scripts": {
+    "test:registry": "node skills/thing-editor-figma-sync/scripts/shared/project-class-registry.mjs",
+    "test:walker": "node skills/thing-editor-figma-sync/scripts/scene-walker.mjs"
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0",
+    "ssim.js": "^3.5.0"
+  }
+}
