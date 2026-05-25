@@ -19,6 +19,11 @@
       "name": "thing-editor-deep",
       "source": "./plugins/thing-editor-deep",
       "description": "Deep architectural reference for Thing-Editor: runtime internals, editor architecture, build pipeline, type system, real game patterns, exhaustive gotcha catalog."
+    },
+    {
+      "name": "thing-editor-design-review",
+      "source": "./plugins/thing-editor-design-review",
+      "description": "Automated design-review for Thing-Editor games against Figma. Orchestrates the design-review CLI: drive a headless editor, diff a scene vs its Figma frame, auto-fix the safe subset, triage the rest, emit a before/after compare page."
     }
   ]
 }
