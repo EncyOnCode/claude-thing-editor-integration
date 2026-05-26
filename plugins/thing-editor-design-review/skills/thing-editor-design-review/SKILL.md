@@ -67,8 +67,15 @@ yields mostly unmatched — then mappings are confirmed by hand into `figma.conn
 The `default` state is the scene as loaded. Any other state needs the scene class to
 implement `__enterReviewState(stateId)`. `design-review scaffold-state <scene>` prints the
 stub. **Filling the hook is the biggest single lever** — an un-driven snapshot leaves ~half
-the diff as `needs-state` noise (prefab defaults, hidden elements). When writing the hook,
-load `thing-editor-deep` and obey §5's un-inited/locals gotcha.
+the diff as `needs-state` noise (prefab defaults, hidden elements).
+
+**Read `tools/design-review/HOOK-COOKBOOK.md` for concrete patterns** — show/hide siblings,
+inject mock data via the child's `__reviewSetData`, mock providers, snap MovieClip/Spine to a
+keyframe, async hooks, per-orientation branching. Working example: checkers
+`scene/main.c.ts` + `screen/gameEndScreen.c.ts` + `ui/gameEndPlayerResultPanel.c.ts`. Load
+`thing-editor-deep` skill if you need engine-internals reasoning beyond what the cookbook
+covers, and obey §5's un-inited/locals gotcha (resolve refs into `const` locals via
+`getValueByPath(this._refPath, this)` — never store on `this`).
 
 ### Step 3 — fix
 `design-review fix <scene> --state=<id>` — diff → classify → auto-patch the safe subset →
